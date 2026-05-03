@@ -15,16 +15,19 @@ removes the Inbox tag when a classification passes validation.
 - JSONL and Markdown audit output for every run
 - Resume support for long local-model jobs
 - Optional deterministic rules for repetitive receipts
-- Optional image thumbnail input for multimodal local models
+- Vision input is on by default for multimodal local models
+- All-page PDF rendering when the context budget allows it
+- Image-first policy: when all pages fit, Paperless OCR text is omitted
 - macOS battery safety: pauses on battery power by default
-- Zero runtime dependencies beyond Python standard library
+- Core uses Python standard library; all-page PDF vision uses optional PyMuPDF
 
 ## Requirements
 
 - Python 3.11+
 - Paperless-ngx API token
 - LM Studio with an OpenAI-compatible local server
-- A local instruction model, for example `gemma-4-31b-it`
+- A local vision-capable instruction model, for example `gemma-4-31b-it`
+- PyMuPDF for all-page PDF rendering
 
 ## Installation
 
@@ -41,12 +44,15 @@ Run directly:
 python3 paperless_lmstudio_classifier.py --self-test
 ```
 
-Or install an editable CLI:
+Install an editable CLI with PDF vision support:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install -e ".[vision]"
 paperless-classifier-ai --self-test
 ```
+
+Without the `vision` extra, PDFs fall back to the Paperless thumbnail and are
+held for review by default.
 
 ## Configuration
 
@@ -71,6 +77,7 @@ PAPERLESS_URL=https://paperless.example.com
 PAPERLESS_TOKEN=replace-me
 LMSTUDIO_URL=http://127.0.0.1:1234/v1
 LMSTUDIO_MODEL=gemma-4-31b-it
+LMSTUDIO_CONTEXT_WINDOW=8096
 ```
 
 The script automatically loads `.env` from the current working directory and
@@ -98,6 +105,7 @@ Run a full resumable dry-run:
 python3 -u paperless_lmstudio_classifier.py \
   --limit 0 \
   --threshold 0.86 \
+  --context-window 8096 \
   --rules-first \
   --drop-bulk-unclassified \
   --resume \
@@ -119,7 +127,10 @@ python3 paperless_lmstudio_classifier.py \
 ```
 
 `--apply-audit` only applies records that were `dry_run_ready`, still pass the
-confidence and review checks, and still have the Inbox tag.
+confidence and review checks, and still have the Inbox tag. With default vision
+enabled, it also requires the dry-run audit record to contain acceptable vision
+evidence; old text-only audits are skipped unless you explicitly pass
+`--no-vision`.
 
 ## Direct Apply Mode
 
@@ -158,17 +169,17 @@ Filter Paperless results:
 python3 paperless_lmstudio_classifier.py --query Cloudflare --limit 10
 ```
 
-Use thumbnails for multimodal local models:
+Disable vision for text-only models:
 
 ```bash
-python3 paperless_lmstudio_classifier.py --vision --limit 5
+python3 paperless_lmstudio_classifier.py --no-vision --limit 5
 ```
 
-Use JSON-schema constrained output when LM Studio is loaded with a larger
-context window:
+Use a larger context window and JSON-schema constrained output:
 
 ```bash
 python3 paperless_lmstudio_classifier.py \
+  --context-window 16384 \
   --response-format json_schema \
   --content-chars 8000
 ```
@@ -187,6 +198,107 @@ python3 paperless_lmstudio_classifier.py \
   --create-document-types \
   --limit 10
 ```
+
+## Vision And OCR Policy
+
+Vision is enabled by default. The script fetches the Paperless preview for each
+document. If it is a PDF and PyMuPDF is installed, it renders page images and
+sends as many pages as fit inside the configured context window. If every page
+fits, the Paperless OCR text is omitted and the model is instructed to read the
+images directly. This uses the local model as the effective OCR source for that
+classification.
+
+If not every page fits, the script sends representative pages across the
+document and includes a Paperless OCR excerpt as fallback context. Partial vision
+is held for review by default; use `--allow-partial-vision` only if you accept
+applying classifications where not every page image was seen.
+
+The page budget is estimated from:
+
+- `--context-window`
+- `--max-tokens`
+- `--context-safety-tokens`
+- the prompt size
+- `--image-token-estimate`
+- optional `--max-vision-pages`
+
+Use these controls when you change the LM Studio context window:
+
+```bash
+python3 paperless_lmstudio_classifier.py \
+  --context-window 8096 \
+  --image-token-estimate 768 \
+  --context-safety-tokens 512 \
+  --limit 10
+```
+
+Paperless preview PDFs require PyMuPDF:
+
+```bash
+python3 -m pip install -e ".[vision]"
+```
+
+## Flag Reference
+
+Connection and model:
+
+- `--paperless-url`: Paperless-ngx base URL. Defaults to `PAPERLESS_URL`.
+- `--paperless-token`: Paperless API token. Defaults to `PAPERLESS_TOKEN`.
+- `--lmstudio-url`: LM Studio OpenAI-compatible API base. Defaults to `LMSTUDIO_URL` or `http://127.0.0.1:1234/v1`.
+- `--model`: LM Studio model name. Defaults to `LMSTUDIO_MODEL` or `gemma-4-31b-it`.
+- `--context-window`: LM Studio context window used for page budgeting. Defaults to `LMSTUDIO_CONTEXT_WINDOW` or `8096`.
+
+Document selection:
+
+- `--label`: Inbox tag name fallback when Paperless does not expose `is_inbox_tag`.
+- `--limit`: Maximum documents to process. `0` means all matching documents.
+- `--id`: Process one document ID. Repeat for multiple IDs.
+- `--query`: Paperless full-text search filter.
+- `--page-size`: Paperless API page size.
+- `--ordering`: Paperless document ordering, for example `-created`.
+- `--resume`: Skip documents that already have terminal records in the chosen `audit.jsonl`.
+
+Apply behavior:
+
+- `--apply`: Patch Paperless metadata and remove the Inbox tag. Without it, the run is dry-run only.
+- `--apply-audit PATH`: Apply exact `dry_run_ready` patches from an existing `audit.jsonl` without rerunning the model.
+- `--force`: Override confidence, review, and safety gates. This is intentionally sharp.
+- `--threshold`: Minimum confidence required for apply.
+
+Vision and text:
+
+- `--vision` / `--no-vision`: Enable or disable image input. Vision is enabled by default.
+- `--vision-dpi`: DPI for rendering Paperless preview PDFs into page images.
+- `--max-vision-pages`: Hard cap on rendered pages. `0` means only the context budget decides.
+- `--allow-partial-vision`: Permit apply when not all pages were sent as images.
+- `--ocr-source auto|always|never`: In `auto`, Paperless OCR is omitted when all pages fit as images and included only as fallback when they do not. `always` includes Paperless OCR. `never` omits it.
+- `--content-chars`: Paperless OCR characters sent when OCR fallback is used.
+- `--image-token-estimate`: Estimated context tokens consumed by each page image.
+- `--context-safety-tokens`: Reserved context tokens for estimator error and protocol overhead.
+
+Classification tuning:
+
+- `--temperature`: LM Studio sampling temperature.
+- `--max-tokens`: Maximum response tokens from LM Studio.
+- `--response-format text|json_schema`: Use `json_schema` only when your LM Studio model and context window handle it reliably.
+- `--rules-first`: Use deterministic rules before LM Studio. Currently this is useful for repetitive REWE eBon receipts.
+- `--replace-tags`: Replace non-Inbox tags with model-selected tags instead of preserving existing non-Inbox tags.
+- `--drop-bulk-unclassified`: Remove the `Bulk Unclassified` tag from the final tag set after a successful classification. This is only tag cleanup; it does not delete documents.
+- `--create-correspondents`: Create missing Paperless correspondents when the model proposes one.
+- `--create-document-types`: Create missing Paperless document types when the model proposes one.
+- `--email-date-drift-review-days`: Hold email terms/conditions documents for review when the chosen date differs too far from the email/document date.
+
+Runtime:
+
+- `--timeout`: HTTP timeout in seconds.
+- `--retries`: Retries for transient LM Studio errors.
+- `--retry-sleep`: Base sleep between LM Studio retries.
+- `--sleep`: Delay between documents.
+- `--allow-battery`: Do not pause on macOS battery power.
+- `--power-check-interval`: Recheck interval while paused on battery.
+- `--output-dir`: Run artifact directory.
+- `--self-test`: Run local parser sanity checks.
+- `--version`: Print the CLI version.
 
 ## Battery Safety
 
@@ -222,6 +334,7 @@ export PAPERLESS_URL="https://paperless.example.com"
 export PAPERLESS_TOKEN="replace-me"
 export LMSTUDIO_URL="http://127.0.0.1:1234/v1"
 export LMSTUDIO_MODEL="gemma-4-31b-it"
+export LMSTUDIO_CONTEXT_WINDOW="8096"
 EOF
 chmod 600 "$HOME/.paperless-classifier-ai.env"
 ```
@@ -284,7 +397,9 @@ python3 -m py_compile paperless_lmstudio_classifier.py
 
 ## Tuning Notes
 
-Defaults are tuned for an LM Studio model loaded with a 4096-token context:
-compact prompts, `--response-format text`, and `--content-chars 2500`. If you
-load the model with a larger context window, raise `--content-chars` and consider
-`--response-format json_schema`.
+Defaults are tuned for an LM Studio model loaded with an `8096` token context:
+compact prompts, `--response-format text`, image-first OCR replacement when all
+pages fit, and Paperless OCR fallback only when needed. If you load the model
+with a larger context window, raise `--context-window` first. Then consider
+raising `--content-chars`, lowering `--image-token-estimate` if your backend
+accounts images cheaply, or trying `--response-format json_schema`.

@@ -9,6 +9,7 @@ paperless_lmstudio_runs/
 !.env.example
 
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 *.pyo

@@ -14,6 +14,7 @@ import argparse
 import base64
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
@@ -28,11 +29,15 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
 DEFAULT_OUTPUT_ROOT = "paperless_lmstudio_runs"
 DEFAULT_THRESHOLD = 0.86
+DEFAULT_CONTEXT_WINDOW = 8096
+DEFAULT_CONTEXT_SAFETY_TOKENS = 512
+DEFAULT_IMAGE_TOKEN_ESTIMATE = 768
+DEFAULT_VISION_DPI = 120
 MAX_TITLE_LEN = 128
 RESUME_SKIP_STATUSES = {
     "dry_run_ready",
@@ -88,6 +93,69 @@ def truncate_text(value: str, limit: int) -> str:
     head = value[: int(limit * 0.72)]
     tail = value[-int(limit * 0.28) :]
     return f"{head}\n\n[... middle truncated by classifier ...]\n\n{tail}"
+
+
+def data_url(content_type: str, raw: bytes) -> str:
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
+
+
+def estimate_tokens_from_text(value: str) -> int:
+    # Good enough for local context budgeting without importing a tokenizer.
+    return math.ceil(len(value) / 4)
+
+
+def positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def select_representative_pages(total_pages: int, max_pages: int) -> list[int]:
+    """Return zero-based page indexes, preferring coverage over contiguity."""
+    if total_pages <= 0 or max_pages <= 0:
+        return []
+    if max_pages >= total_pages:
+        return list(range(total_pages))
+    if max_pages == 1:
+        return [0]
+
+    selected = {
+        round(position * (total_pages - 1) / (max_pages - 1))
+        for position in range(max_pages)
+    }
+    candidate = 0
+    while len(selected) < max_pages and candidate < total_pages:
+        selected.add(candidate)
+        candidate += 1
+    return sorted(selected)[:max_pages]
+
+
+def vision_page_budget(
+    args: argparse.Namespace,
+    user_text: str,
+    total_pages: int,
+) -> tuple[int, dict[str, Any]]:
+    prompt_tokens = estimate_tokens_from_text(build_system_prompt()) + estimate_tokens_from_text(user_text)
+    available = args.context_window - args.max_tokens - args.context_safety_tokens - prompt_tokens
+    by_context = max(0, available // max(1, args.image_token_estimate))
+    if total_pages > 0 and by_context == 0:
+        by_context = 1
+    if args.max_vision_pages:
+        by_context = min(by_context, args.max_vision_pages)
+    selected_count = max(0, min(total_pages, by_context))
+    return selected_count, {
+        "context_window": args.context_window,
+        "context_safety_tokens": args.context_safety_tokens,
+        "max_response_tokens": args.max_tokens,
+        "estimated_text_tokens": prompt_tokens,
+        "estimated_image_tokens_each": args.image_token_estimate,
+        "estimated_available_image_tokens": available,
+        "max_pages_by_context": by_context,
+        "max_vision_pages": args.max_vision_pages,
+    }
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -264,6 +332,12 @@ class Resource:
     name: str
     slug: str | None = None
     is_inbox_tag: bool = False
+
+
+@dataclass(frozen=True)
+class VisionImage:
+    page_number: int
+    data_url: str
 
 
 class ResourceCatalog:
@@ -456,8 +530,10 @@ class PaperlessClient:
 
     def thumbnail_data_url(self, doc_id: int) -> str:
         raw, content_type = self.bytes(f"/api/documents/{doc_id}/thumb/")
-        encoded = base64.b64encode(raw).decode("ascii")
-        return f"data:{content_type};base64,{encoded}"
+        return data_url(content_type, raw)
+
+    def preview_bytes(self, doc_id: int) -> tuple[bytes, str]:
+        return self.bytes(f"/api/documents/{doc_id}/preview/")
 
 
 class LMStudioClient:
@@ -589,7 +665,7 @@ def classification_response_format() -> dict[str, Any]:
 def build_system_prompt() -> str:
     return """Classify Paperless-ngx documents. Return one strict JSON object and no prose.
 
-Rules: company=sender/issuer/merchant/court/employer/provider, not recipient or employee. For work timesheets use the employer/client company, not the worker name. created=document issue/signature/submission/transaction/letter date, not import date. If a document covers a period/year, put that period in the title; do not use period end such as Dec 31 as created when a signing/issue/submission date is visible. Use existing IDs when possible. Preserve an existing correspondent/type when it is semantically compatible. Invoice/receipt/eBon/bill => Rechnung if available. Tags must be existing IDs, but never include Inbox. Keep Email Attachment for emails. If no existing company/type fits, id null + create true. Never delete; mark delete_candidate only. needs_review true if weak/ambiguous/missing IDs. Confidence means safe to apply.
+Rules: When page images are attached, read the images directly and treat visual text as the source of truth. Paperless OCR content may be omitted, partial, or only a fallback. company=sender/issuer/merchant/court/employer/provider, not recipient or employee. For work timesheets use the employer/client company, not the worker name. created=document issue/signature/submission/transaction/letter date, not import date. If a document covers a period/year, put that period in the title; do not use period end such as Dec 31 as created when a signing/issue/submission date is visible. Use existing IDs when possible. Preserve an existing correspondent/type when it is semantically compatible. Invoice/receipt/eBon/bill => Rechnung if available. Tags must be existing IDs, but never include Inbox. Keep Email Attachment for emails. If no existing company/type fits, id null + create true. Never delete; mark delete_candidate only. needs_review true if weak/ambiguous/missing IDs. Confidence means safe to apply.
 
 Required JSON shape:
 {
@@ -611,6 +687,9 @@ def build_user_message(
     doc: dict[str, Any],
     catalog: ResourceCatalog,
     content_chars: int,
+    paperless_ocr_content: str | None,
+    paperless_ocr_policy: str,
+    vision: dict[str, Any] | None = None,
 ) -> str:
     existing_tag_names = [
         catalog.tags[tag_id].name for tag_id in doc.get("tags", []) if tag_id in catalog.tags
@@ -636,30 +715,209 @@ def build_user_message(
             "existing_tag_names": existing_tag_names,
             "existing_correspondent_name": existing_correspondent_name,
             "existing_document_type_name": existing_document_type_name,
-            "content": truncate_text(str(doc.get("content") or ""), content_chars),
+            "paperless_ocr_policy": paperless_ocr_policy,
+            "content": truncate_text(paperless_ocr_content or "", content_chars)
+            if paperless_ocr_content is not None
+            else "",
+            "vision": vision or {},
         },
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def build_messages(
-    doc: dict[str, Any],
-    catalog: ResourceCatalog,
-    content_chars: int,
-    image_data_url: str | None,
-) -> list[dict[str, Any]]:
-    user_text = build_user_message(doc, catalog, content_chars)
-    if image_data_url:
-        content: Any = [
-            {"type": "text", "text": user_text},
-            {"type": "image_url", "image_url": {"url": image_data_url}},
-        ]
+def build_messages(user_text: str, images: list[VisionImage]) -> list[dict[str, Any]]:
+    if images:
+        content: Any = [{"type": "text", "text": user_text}]
+        content.extend(
+            {"type": "image_url", "image_url": {"url": image.data_url}}
+            for image in images
+        )
     else:
         content = user_text
     return [
         {"role": "system", "content": build_system_prompt()},
         {"role": "user", "content": content},
     ]
+
+
+def should_omit_paperless_ocr(
+    doc: dict[str, Any],
+    catalog: ResourceCatalog,
+    args: argparse.Namespace,
+) -> bool:
+    if not args.vision:
+        return False
+    if args.ocr_source == "always":
+        return False
+    if args.ocr_source == "never":
+        return True
+
+    total_pages = positive_int(doc.get("page_count"))
+    if not total_pages:
+        return False
+    metadata_text = build_user_message(
+        doc,
+        catalog,
+        args.content_chars,
+        None,
+        "omitted_for_context_estimate",
+        {"enabled": True, "requested_pages": "all"},
+    )
+    page_budget, _ = vision_page_budget(args, metadata_text, total_pages)
+    return page_budget >= total_pages
+
+
+def render_pdf_vision_images(
+    raw: bytes,
+    args: argparse.Namespace,
+    user_text: str,
+) -> tuple[list[VisionImage], dict[str, Any]]:
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ClassifierError(
+            "PDF all-page vision requires PyMuPDF. Install with "
+            "`python3 -m pip install '.[vision]'`, or pass --no-vision."
+        ) from exc
+
+    try:
+        pdf = fitz.open(stream=raw, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001 - convert renderer failures into audit warnings.
+        raise ClassifierError(f"Could not open Paperless preview PDF for vision: {exc}") from exc
+
+    try:
+        total_pages = int(pdf.page_count)
+        page_budget, budget_info = vision_page_budget(args, user_text, total_pages)
+        selected = select_representative_pages(total_pages, page_budget)
+        scale = args.vision_dpi / 72.0
+        matrix = fitz.Matrix(scale, scale)
+        images: list[VisionImage] = []
+        for page_index in selected:
+            page = pdf.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            images.append(
+                VisionImage(
+                    page_number=page_index + 1,
+                    data_url=data_url("image/png", pixmap.tobytes("png")),
+                )
+            )
+    finally:
+        pdf.close()
+
+    included_pages = [image.page_number for image in images]
+    warnings: list[str] = []
+    if not images:
+        warnings.append("vision enabled but context budget did not allow any page images")
+    elif len(images) < total_pages:
+        warnings.append(
+            f"vision included {len(images)} of {total_pages} pages due to context/page budget"
+        )
+
+    return images, {
+        "enabled": True,
+        "source": "paperless_preview_pdf",
+        "renderer": "PyMuPDF",
+        "dpi": args.vision_dpi,
+        "page_count": total_pages,
+        "included_pages": included_pages,
+        "omitted_pages": [
+            page_number
+            for page_number in range(1, total_pages + 1)
+            if page_number not in set(included_pages)
+        ],
+        "all_pages_included": len(images) == total_pages,
+        "image_count": len(images),
+        "budget": budget_info,
+        "warnings": warnings,
+    }
+
+
+def thumbnail_fallback_vision(
+    paperless: PaperlessClient,
+    doc_id: int,
+    warning: str,
+) -> tuple[list[VisionImage], dict[str, Any]]:
+    try:
+        thumbnail = paperless.thumbnail_data_url(doc_id)
+    except Exception as exc:  # noqa: BLE001 - this becomes an audited review item.
+        return [], {
+            "enabled": True,
+            "source": "unavailable",
+            "page_count": None,
+            "included_pages": [],
+            "omitted_pages": [],
+            "all_pages_included": False,
+            "image_count": 0,
+            "warnings": [warning, f"thumbnail fallback failed: {exc}"],
+        }
+    return [VisionImage(page_number=1, data_url=thumbnail)], {
+        "enabled": True,
+        "source": "paperless_thumbnail_fallback",
+        "page_count": None,
+        "included_pages": [1],
+        "omitted_pages": [],
+        "all_pages_included": False,
+        "image_count": 1,
+        "warnings": [warning, "used thumbnail fallback instead of all-page vision"],
+    }
+
+
+def build_vision_inputs(
+    doc: dict[str, Any],
+    paperless: PaperlessClient,
+    args: argparse.Namespace,
+    user_text: str,
+) -> tuple[list[VisionImage], dict[str, Any]]:
+    if not args.vision:
+        return [], {"enabled": False, "source": "disabled", "warnings": []}
+
+    doc_id = int(doc["id"])
+    try:
+        raw, content_type = paperless.preview_bytes(doc_id)
+    except Exception as exc:  # noqa: BLE001 - keep classification auditable.
+        return thumbnail_fallback_vision(
+            paperless,
+            doc_id,
+            f"could not fetch Paperless preview for all-page vision: {exc}",
+        )
+
+    media_type = content_type.split(";", 1)[0].strip().casefold()
+    if media_type == "application/pdf" or raw.startswith(b"%PDF"):
+        try:
+            return render_pdf_vision_images(raw, args, user_text)
+        except ClassifierError as exc:
+            return thumbnail_fallback_vision(paperless, doc_id, str(exc))
+
+    if media_type.startswith("image/"):
+        return [VisionImage(page_number=1, data_url=data_url(media_type, raw))], {
+            "enabled": True,
+            "source": "paperless_preview_image",
+            "page_count": 1,
+            "included_pages": [1],
+            "omitted_pages": [],
+            "all_pages_included": True,
+            "image_count": 1,
+            "warnings": [],
+        }
+
+    return thumbnail_fallback_vision(
+        paperless,
+        doc_id,
+        f"Paperless preview content type {content_type!r} is not directly renderable as page images",
+    )
+
+
+def vision_review_warnings(vision: dict[str, Any] | None, args: argparse.Namespace) -> list[str]:
+    if not args.vision:
+        return []
+    if not isinstance(vision, dict) or not vision.get("enabled"):
+        return ["vision enabled but audit/classification has no vision evidence"]
+    warnings = list(vision.get("warnings") or [])
+    if not vision.get("image_count"):
+        warnings.append("vision enabled but no images were sent")
+    if not vision.get("all_pages_included") and not args.allow_partial_vision:
+        warnings.append("all-page vision was not available")
+    return sorted(set(str(warning) for warning in warnings if warning))
 
 
 def nested_resource(raw: dict[str, Any], key: str) -> tuple[int | None, str | None, bool]:
@@ -978,6 +1236,12 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
     skipped = [r for r in records if r["status"].startswith("skipped")]
     failed = [r for r in records if r["status"] == "failed"]
     deletes = [r for r in records if r.get("classification", {}).get("delete_candidate")]
+    vision_incomplete = [
+        r
+        for r in records
+        if r.get("classification", {}).get("vision", {}).get("enabled")
+        and not r.get("classification", {}).get("vision", {}).get("all_pages_included")
+    ]
 
     lines = [
         "# Paperless LM Studio Classification Run",
@@ -990,6 +1254,7 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
         f"- Dry-run ready: `{len(dry_ready)}`",
         f"- Skipped: `{len(skipped)}`",
         f"- Failed: `{len(failed)}`",
+        f"- Vision incomplete: `{len(vision_incomplete)}`",
         "",
     ]
     if deletes:
@@ -1012,8 +1277,14 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
     lines.extend(["## Successful classifications", ""])
     for record in updated + dry_ready:
         c = record.get("classification", {})
+        vision = c.get("vision") or {}
+        vision_suffix = ""
+        if vision.get("enabled"):
+            vision_suffix = (
+                f" | vision `{vision.get('image_count', 0)}/{vision.get('page_count') or '?'} pages`"
+            )
         lines.append(
-            f"- `{record['document_id']}`: {c.get('title')} | company `{c.get('correspondent_name')}` | type `{c.get('document_type_name')}` | date `{c.get('created')}` | confidence `{c.get('confidence')}`"
+            f"- `{record['document_id']}`: {c.get('title')} | company `{c.get('correspondent_name')}` | type `{c.get('document_type_name')}` | date `{c.get('created')}` | confidence `{c.get('confidence')}`{vision_suffix}"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1034,15 +1305,65 @@ def classify_one(
 
     raw_text = None
     if raw is None:
-        image_data_url = None
-        if args.vision:
-            image_data_url = paperless.thumbnail_data_url(int(doc["id"]))
-        messages = build_messages(doc, catalog, args.content_chars, image_data_url)
+        omit_paperless_ocr = should_omit_paperless_ocr(doc, catalog, args)
+        paperless_ocr = None if omit_paperless_ocr else str(doc.get("content") or "")
+        ocr_policy = (
+            "omitted_because_all_pages_fit_in_vision_context"
+            if omit_paperless_ocr
+            else "included_as_fallback_or_partial_vision_context"
+        )
+        preliminary_user_text = build_user_message(
+            doc,
+            catalog,
+            args.content_chars,
+            paperless_ocr,
+            ocr_policy,
+            {"enabled": args.vision, "requested_pages": "all"},
+        )
+        images, vision = build_vision_inputs(doc, paperless, args, preliminary_user_text)
+        if (
+            omit_paperless_ocr
+            and args.ocr_source == "auto"
+            and args.vision
+            and not vision.get("all_pages_included")
+        ):
+            omit_paperless_ocr = False
+            paperless_ocr = str(doc.get("content") or "")
+            ocr_policy = "included_because_all_page_vision_was_not_available"
+            preliminary_user_text = build_user_message(
+                doc,
+                catalog,
+                args.content_chars,
+                paperless_ocr,
+                ocr_policy,
+                {"enabled": args.vision, "requested_pages": "all"},
+            )
+            images, vision = build_vision_inputs(doc, paperless, args, preliminary_user_text)
+        user_text = build_user_message(
+            doc,
+            catalog,
+            args.content_chars,
+            paperless_ocr,
+            ocr_policy,
+            {
+                key: value
+                for key, value in vision.items()
+                if key not in {"warnings", "budget"}
+            },
+        )
+        messages = build_messages(user_text, images)
         raw, raw_text = lmstudio.classify(messages)
         raw_source = "lmstudio"
+    else:
+        vision = {"enabled": False, "source": "rule", "warnings": []}
 
     normalized = normalize_classification(raw, doc, catalog, args)
     normalized["source"] = raw_source
+    normalized["vision"] = vision
+    vision_warnings = [] if raw_source == "rule" else vision_review_warnings(vision, args)
+    if vision_warnings:
+        normalized["warnings"] = sorted(set(normalized.get("warnings", []) + vision_warnings))
+        normalized["needs_review"] = True
     if raw_text:
         normalized["raw_text"] = raw_text
     return normalized
@@ -1201,6 +1522,10 @@ def apply_from_audit(args: argparse.Namespace) -> int:
                 record["original_title"] = current.get("title")
                 record["original_tags"] = current.get("tags", [])
                 safety_warnings = classification_safety_warnings(current, classification, args)
+                if classification.get("source") != "rule":
+                    safety_warnings.extend(
+                        vision_review_warnings(classification.get("vision"), args)
+                    )
                 if safety_warnings and not args.force:
                     classification["needs_review"] = True
                     classification["warnings"] = sorted(
@@ -1244,6 +1569,8 @@ def self_test() -> int:
     assert is_date("2026-05-03")
     assert not is_date("03.05.2026")
     assert safe_title("", "Fallback") == "Fallback"
+    assert select_representative_pages(5, 3) == [0, 2, 4]
+    assert select_representative_pages(2, 10) == [0, 1]
     print("Self-test passed", flush=True)
     return 0
 
@@ -1273,12 +1600,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.1, help="LM Studio sampling temperature")
     parser.add_argument("--max-tokens", type=int, default=1200, help="Maximum LM Studio response tokens")
     parser.add_argument(
+        "--context-window",
+        type=int,
+        default=int(os.getenv("LMSTUDIO_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)),
+        help="LM Studio context window used for image page budgeting",
+    )
+    parser.add_argument(
+        "--context-safety-tokens",
+        type=int,
+        default=DEFAULT_CONTEXT_SAFETY_TOKENS,
+        help="Reserved context tokens for schema overhead and estimator error",
+    )
+    parser.add_argument(
+        "--image-token-estimate",
+        type=int,
+        default=DEFAULT_IMAGE_TOKEN_ESTIMATE,
+        help="Estimated context tokens consumed by each rendered page image",
+    )
+    parser.add_argument(
         "--response-format",
         choices=["json_schema", "text"],
         default="text",
         help="Use json_schema only when LM Studio is loaded with enough context",
     )
-    parser.add_argument("--content-chars", type=int, default=2500, help="Document text characters sent to the model")
+    parser.add_argument("--content-chars", type=int, default=2500, help="Paperless OCR characters sent when OCR fallback is used")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds")
     parser.add_argument("--retries", type=int, default=2, help="Retries for transient LM Studio errors")
     parser.add_argument("--retry-sleep", type=float, default=3.0, help="Base sleep between LM Studio retries")
@@ -1296,7 +1641,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--apply-audit", help="Apply dry-run-ready patches from an audit.jsonl without reclassifying")
     parser.add_argument("--apply", action="store_true", help="Patch Paperless records. Omit for dry-run.")
     parser.add_argument("--force", action="store_true", help="Apply even when needs_review/confidence gate fails")
-    parser.add_argument("--vision", action="store_true", help="Send Paperless thumbnail as an image_url to LM Studio")
+    parser.add_argument(
+        "--vision",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Send rendered Paperless page images to LM Studio; use --no-vision to disable",
+    )
+    parser.add_argument(
+        "--vision-dpi",
+        type=int,
+        default=DEFAULT_VISION_DPI,
+        help="DPI used when rendering Paperless preview PDFs into page images",
+    )
+    parser.add_argument(
+        "--max-vision-pages",
+        type=int,
+        default=0,
+        help="Hard cap on rendered vision pages; 0 means only the context budget decides",
+    )
+    parser.add_argument(
+        "--allow-partial-vision",
+        action="store_true",
+        help="Allow apply when only a representative subset of pages was sent",
+    )
+    parser.add_argument(
+        "--ocr-source",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Use Paperless OCR always, never, or only when not all pages fit as images",
+    )
     parser.add_argument("--rules-first", action="store_true", help="Use deterministic vendor rules before LM Studio")
     parser.add_argument("--replace-tags", action="store_true", help="Replace non-Inbox tags instead of preserving them")
     parser.add_argument("--drop-bulk-unclassified", action="store_true", help="Drop Bulk Unclassified after classification")
@@ -1306,6 +1679,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         args.limit = None
+    if args.context_window < 1:
+        parser.error("--context-window must be positive")
+    if args.context_safety_tokens < 0:
+        parser.error("--context-safety-tokens must not be negative")
+    if args.image_token_estimate < 1:
+        parser.error("--image-token-estimate must be positive")
+    if args.vision_dpi < 1:
+        parser.error("--vision-dpi must be positive")
+    if args.max_vision_pages < 0:
+        parser.error("--max-vision-pages must not be negative")
     return args
 
 
