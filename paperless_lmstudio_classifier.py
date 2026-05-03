@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures as futures
 import datetime as dt
 import json
 import math
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
@@ -40,6 +41,7 @@ DEFAULT_CONTEXT_WINDOW = 8096
 DEFAULT_CONTEXT_SAFETY_TOKENS = 512
 DEFAULT_IMAGE_TOKEN_ESTIMATE = 768
 DEFAULT_VISION_DPI = 120
+DEFAULT_WORKERS = 1
 MAX_TITLE_LEN = 128
 RESUME_SKIP_STATUSES = {
     "dry_run_ready",
@@ -1333,6 +1335,24 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def append_record_and_print(
+    records: list[dict[str, Any]],
+    audit_jsonl: Path,
+    record: dict[str, Any],
+    completed: int,
+    total: int,
+) -> None:
+    records.append(record)
+    write_jsonl(audit_jsonl, record)
+    title = record.get("classification", {}).get("title") or record.get("original_title")
+    queued = record.get("index")
+    queued_suffix = f" queued #{queued}" if queued and queued != completed else ""
+    print(
+        f"[{completed}/{total}]{queued_suffix} {record['document_id']}: {record['status']} - {title}",
+        flush=True,
+    )
+
+
 def latest_by_document(records: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     latest: dict[int, dict[str, Any]] = {}
     for record in records:
@@ -1522,6 +1542,11 @@ def run(args: argparse.Namespace) -> int:
         raise ClassifierError("Set PAPERLESS_TOKEN or pass --paperless-token")
     if args.provider == "openrouter" and not args.llm_api_key:
         raise ClassifierError("Set OPENROUTER_API_KEY or pass --llm-api-key for OpenRouter")
+    if args.workers > 1 and (args.create_correspondents or args.create_document_types):
+        raise ClassifierError(
+            "--workers > 1 cannot be combined with --create-correspondents or "
+            "--create-document-types because resource creation must be serialized"
+        )
 
     output_dir = Path(args.output_dir or Path(DEFAULT_OUTPUT_ROOT) / now_stamp())
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1569,9 +1594,9 @@ def run(args: argparse.Namespace) -> int:
         print(f"Resume: {len(existing_records)} existing audit records", flush=True)
     print(f"Documents queued: {len(ids)}", flush=True)
     print(f"Mode: {'APPLY' if args.apply else 'DRY-RUN'}", flush=True)
+    print(f"Workers: {args.workers}", flush=True)
 
-    records: list[dict[str, Any]] = list(existing_records)
-    for index, doc_id in enumerate(ids, 1):
+    def process_doc(index: int, doc_id: int) -> dict[str, Any]:
         record: dict[str, Any] = {"document_id": doc_id, "index": index}
         try:
             wait_for_ac_power(args)
@@ -1602,13 +1627,34 @@ def run(args: argparse.Namespace) -> int:
             record["status"] = "failed"
             record["error"] = str(exc)
 
-        records.append(record)
-        write_jsonl(audit_jsonl, record)
-        status = record["status"]
-        title = record.get("classification", {}).get("title") or record.get("original_title")
-        print(f"[{index}/{len(ids)}] {doc_id}: {status} - {title}", flush=True)
         if args.sleep:
             time.sleep(args.sleep)
+        return record
+
+    records: list[dict[str, Any]] = list(existing_records)
+    total = len(ids)
+    if args.workers == 1:
+        for index, doc_id in enumerate(ids, 1):
+            record = process_doc(index, doc_id)
+            append_record_and_print(records, audit_jsonl, record, index, total)
+    else:
+        with futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_map = {
+                executor.submit(process_doc, index, doc_id): (index, doc_id)
+                for index, doc_id in enumerate(ids, 1)
+            }
+            for completed, future in enumerate(futures.as_completed(future_map), 1):
+                index, doc_id = future_map[future]
+                try:
+                    record = future.result()
+                except Exception as exc:  # noqa: BLE001 - executor-level failure should be audited.
+                    record = {
+                        "document_id": doc_id,
+                        "index": index,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                append_record_and_print(records, audit_jsonl, record, completed, total)
 
     markdown_summary(audit_md, records, args)
     print(f"Audit JSONL: {audit_jsonl}", flush=True)
@@ -1646,9 +1692,9 @@ def apply_from_audit(args: argparse.Namespace) -> int:
     print(f"Applying audited patches from: {source}", flush=True)
     print(f"Run directory: {output_dir}", flush=True)
     print(f"Audited patches queued: {len(candidates)}", flush=True)
+    print(f"Workers: {args.workers}", flush=True)
 
-    records: list[dict[str, Any]] = []
-    for index, source_record in enumerate(candidates, 1):
+    def process_candidate(index: int, source_record: dict[str, Any]) -> dict[str, Any]:
         doc_id = int(source_record["document_id"])
         record = {
             "document_id": doc_id,
@@ -1697,12 +1743,37 @@ def apply_from_audit(args: argparse.Namespace) -> int:
             record["status"] = "failed"
             record["error"] = str(exc)
 
-        records.append(record)
-        write_jsonl(audit_jsonl, record)
-        title = record.get("classification", {}).get("title") or record.get("original_title")
-        print(f"[{index}/{len(candidates)}] {doc_id}: {record['status']} - {title}", flush=True)
         if args.sleep:
             time.sleep(args.sleep)
+        return record
+
+    records: list[dict[str, Any]] = []
+    total = len(candidates)
+    if args.workers == 1:
+        for index, source_record in enumerate(candidates, 1):
+            record = process_candidate(index, source_record)
+            append_record_and_print(records, audit_jsonl, record, index, total)
+    else:
+        with futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_map = {
+                executor.submit(process_candidate, index, source_record): (
+                    index,
+                    int(source_record["document_id"]),
+                )
+                for index, source_record in enumerate(candidates, 1)
+            }
+            for completed, future in enumerate(futures.as_completed(future_map), 1):
+                index, doc_id = future_map[future]
+                try:
+                    record = future.result()
+                except Exception as exc:  # noqa: BLE001 - executor-level failure should be audited.
+                    record = {
+                        "document_id": doc_id,
+                        "index": index,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                append_record_and_print(records, audit_jsonl, record, completed, total)
 
     markdown_summary(audit_md, records, args)
     print(f"Audit JSONL: {audit_jsonl}", flush=True)
@@ -1813,6 +1884,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds")
     parser.add_argument("--retries", type=int, default=2, help="Retries for transient LLM errors")
     parser.add_argument("--retry-sleep", type=float, default=3.0, help="Base sleep between LLM retries")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.getenv("PAPERLESS_AI_WORKERS", DEFAULT_WORKERS)),
+        help="Documents to process concurrently",
+    )
     parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between documents")
     parser.add_argument("--allow-battery", action="store_true", help="Do not pause when macOS reports Battery Power")
     parser.add_argument("--power-check-interval", type=float, default=300.0, help="Seconds between AC-power checks while paused")
@@ -1892,6 +1969,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--vision-dpi must be positive")
     if args.max_vision_pages < 0:
         parser.error("--max-vision-pages must not be negative")
+    if args.workers < 1:
+        parser.error("--workers must be positive")
     if args.pdf_input == "openrouter-file" and args.provider != "openrouter":
         parser.error("--pdf-input openrouter-file requires --provider openrouter")
     return args

@@ -133,6 +133,7 @@ python3 -u paperless_lmstudio_classifier.py \
   --limit 0 \
   --threshold 0.86 \
   --context-window 8096 \
+  --workers 4 \
   --rules-first \
   --drop-bulk-unclassified \
   --resume \
@@ -158,6 +159,12 @@ confidence and review checks, and still have the Inbox tag. With default vision
 enabled, it also requires the dry-run audit record to contain acceptable vision
 evidence; old text-only audits are skipped unless you explicitly pass
 `--no-vision`.
+
+`--workers` controls parallelism. Use `1` for strictly serial local runs. For a
+hosted provider such as OpenRouter, start with `--workers 3` or `--workers 4`
+and increase only if the provider rate limits and Paperless stay comfortable.
+Parallel classification cannot be combined with automatic creation of missing
+correspondents or document types.
 
 ## Direct Apply Mode
 
@@ -326,6 +333,7 @@ Runtime:
 - `--timeout`: HTTP timeout in seconds.
 - `--retries`: Retries for transient LLM errors.
 - `--retry-sleep`: Base sleep between LLM retries.
+- `--workers`: Documents to process concurrently. Defaults to `PAPERLESS_AI_WORKERS` or `1`.
 - `--sleep`: Delay between documents.
 - `--allow-battery`: Do not pause on macOS battery power.
 - `--power-check-interval`: Recheck interval while paused on battery.
@@ -368,6 +376,7 @@ export PAPERLESS_TOKEN="replace-me"
 export LMSTUDIO_URL="http://127.0.0.1:1234/v1"
 export LMSTUDIO_MODEL="gemma-4-31b-it"
 export LMSTUDIO_CONTEXT_WINDOW="8096"
+export PAPERLESS_AI_WORKERS="1"
 EOF
 chmod 600 "$HOME/.paperless-classifier-ai.env"
 ```
