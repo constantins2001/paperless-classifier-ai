@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
@@ -1610,7 +1610,8 @@ def run(args: argparse.Namespace) -> int:
                 record["status"] = "skipped_delete_candidate"
                 record["skip_reason"] = normalized.get("delete_reason") or "delete candidate"
             else:
-                create_missing_resources(normalized, paperless, catalog, args)
+                if args.apply:
+                    create_missing_resources(normalized, paperless, catalog, args)
                 ready, reason = should_apply(normalized, args)
                 record["patch"] = build_patch(normalized) if ready else None
                 if not ready:

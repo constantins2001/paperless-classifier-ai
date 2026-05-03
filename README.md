@@ -166,6 +166,59 @@ and increase only if the provider rate limits and Paperless stay comfortable.
 Parallel classification cannot be combined with automatic creation of missing
 correspondents or document types.
 
+## Parallel Bulk And Metadata Creation
+
+For the initial Inbox cleanup, use parallel dry-run classification with existing
+Paperless metadata only:
+
+```bash
+python3 -u paperless_lmstudio_classifier.py \
+  --provider openrouter \
+  --limit 0 \
+  --workers 32 \
+  --threshold 0.86 \
+  --rules-first \
+  --drop-bulk-unclassified \
+  --resume \
+  --output-dir paperless_lmstudio_runs/openrouter-bulk-vision-001
+```
+
+That pass will not create correspondents or document types. If the model needs a
+new correspondent or document type, the document is held for review because the
+resource does not exist yet.
+
+After reviewing the audit, run a serial creation/apply pass. Do not reuse the
+same output directory with `--resume`, because the first pass has already
+recorded those review records and resume would skip them. Use a new output
+directory, or pass explicit `--id` values for the reviewed documents:
+
+```bash
+python3 -u paperless_lmstudio_classifier.py \
+  --provider openrouter \
+  --workers 1 \
+  --create-correspondents \
+  --create-document-types \
+  --threshold 0.86 \
+  --rules-first \
+  --drop-bulk-unclassified \
+  --apply \
+  --output-dir paperless_lmstudio_runs/openrouter-serial-create-001
+```
+
+The serial creation pass can create missing correspondents/document types and
+then apply the document patch. Creation only happens during `--apply`; dry-run
+mode never mutates Paperless metadata.
+
+For documents that were already `dry_run_ready` in the bulk audit and do not
+need new metadata, use `--apply-audit` instead of reclassifying:
+
+```bash
+python3 paperless_lmstudio_classifier.py \
+  --apply-audit paperless_lmstudio_runs/openrouter-bulk-vision-001/audit.jsonl \
+  --threshold 0.86 \
+  --workers 4
+```
+
 ## Direct Apply Mode
 
 For small daily batches, you can classify and apply in one run:
@@ -224,12 +277,13 @@ Use deterministic rules before LM Studio for repetitive vendors:
 python3 paperless_lmstudio_classifier.py --rules-first --query REWE --limit 100
 ```
 
-Allow creation of missing Paperless metadata:
+Allow creation of missing Paperless metadata during apply:
 
 ```bash
 python3 paperless_lmstudio_classifier.py \
   --create-correspondents \
   --create-document-types \
+  --apply \
   --limit 10
 ```
 
@@ -324,8 +378,8 @@ Classification tuning:
 - `--rules-first`: Use deterministic rules before the LLM. Currently this is useful for repetitive REWE eBon receipts.
 - `--replace-tags`: Replace non-Inbox tags with model-selected tags instead of preserving existing non-Inbox tags.
 - `--drop-bulk-unclassified`: Remove the `Bulk Unclassified` tag from the final tag set after a successful classification. This is only tag cleanup; it does not delete documents.
-- `--create-correspondents`: Create missing Paperless correspondents when the model proposes one.
-- `--create-document-types`: Create missing Paperless document types when the model proposes one.
+- `--create-correspondents`: During `--apply`, create missing Paperless correspondents when the model proposes one. Requires `--workers 1`.
+- `--create-document-types`: During `--apply`, create missing Paperless document types when the model proposes one. Requires `--workers 1`.
 - `--email-date-drift-review-days`: Hold email terms/conditions documents for review when the chosen date differs too far from the email/document date.
 
 Runtime:
