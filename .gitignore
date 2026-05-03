@@ -1,0 +1,27 @@
+# Runtime artifacts and local state
+paperless_lmstudio_runs/
+*.log
+*.pid
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
