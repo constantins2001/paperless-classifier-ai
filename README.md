@@ -1,10 +1,12 @@
 # Paperless Classifier AI
 
-Conservative Paperless-ngx Inbox classifier powered by a local LM Studio model.
+Conservative Paperless-ngx Inbox classifier powered by an OpenAI-compatible
+vision model.
 
 The tool fetches Inbox documents from Paperless, asks a local OpenAI-compatible
-LM Studio server to classify metadata, writes auditable dry-run output, and only
-removes the Inbox tag when a classification passes validation.
+LM Studio server or hosted provider such as OpenRouter to classify metadata,
+writes auditable dry-run output, and only removes the Inbox tag when a
+classification passes validation.
 
 ## Highlights
 
@@ -25,8 +27,8 @@ removes the Inbox tag when a classification passes validation.
 
 - Python 3.11+
 - Paperless-ngx API token
-- LM Studio with an OpenAI-compatible local server
-- A local vision-capable instruction model, for example `gemma-4-31b-it`
+- LM Studio with an OpenAI-compatible local server, or OpenRouter
+- A vision-capable instruction model, for example `gemma-4-31b-it` locally or `google/gemma-4-31b-it` on OpenRouter
 - PyMuPDF for all-page PDF rendering
 
 ## Installation
@@ -56,8 +58,8 @@ held for review by default.
 
 ## Configuration
 
-Start LM Studio, load your model, and enable the local server. The default
-endpoint is:
+For LM Studio, load your model and enable the local server. The default endpoint
+is:
 
 ```text
 http://127.0.0.1:1234/v1
@@ -75,14 +77,39 @@ Edit `.env`:
 ```bash
 PAPERLESS_URL=https://paperless.example.com
 PAPERLESS_TOKEN=replace-me
-LMSTUDIO_URL=http://127.0.0.1:1234/v1
-LMSTUDIO_MODEL=gemma-4-31b-it
-LMSTUDIO_CONTEXT_WINDOW=8096
+LLM_PROVIDER=lmstudio
+LLM_URL=http://127.0.0.1:1234/v1
+LLM_MODEL=gemma-4-31b-it
+LLM_CONTEXT_WINDOW=8096
 ```
 
 The script automatically loads `.env` from the current working directory and
 does not overwrite variables that are already present in the environment. It
 intentionally does not store API keys anywhere else.
+
+For OpenRouter bulk runs, use a private ignored env file instead of committing
+secrets:
+
+```bash
+cat > .env.openrouter <<'EOF'
+export PAPERLESS_URL="https://paperless.example.com"
+export PAPERLESS_TOKEN="replace-me"
+export LLM_PROVIDER="openrouter"
+export LLM_URL="https://openrouter.ai/api/v1"
+export LLM_MODEL="google/gemma-4-31b-it"
+export LLM_CONTEXT_WINDOW="8096"
+export OPENROUTER_API_KEY="replace-me"
+export OPENROUTER_PDF_ENGINE="mistral-ocr"
+export OPENROUTER_APP_NAME="paperless-classifier-ai"
+EOF
+chmod 600 .env.openrouter
+```
+
+When `--provider openrouter` is used, PDF inputs default to OpenRouter's `file`
+content type with the `file-parser` plugin and `mistral-ocr` engine. That means
+PDFs are sent as PDFs, not as local screenshots, and the model receives
+OpenRouter's parsed/OCRed document content. Use `--pdf-input rendered-images` if
+you want the local page-rendering path instead.
 
 ## Safe Dry Run
 
@@ -244,9 +271,13 @@ Connection and model:
 
 - `--paperless-url`: Paperless-ngx base URL. Defaults to `PAPERLESS_URL`.
 - `--paperless-token`: Paperless API token. Defaults to `PAPERLESS_TOKEN`.
-- `--lmstudio-url`: LM Studio OpenAI-compatible API base. Defaults to `LMSTUDIO_URL` or `http://127.0.0.1:1234/v1`.
-- `--model`: LM Studio model name. Defaults to `LMSTUDIO_MODEL` or `gemma-4-31b-it`.
-- `--context-window`: LM Studio context window used for page budgeting. Defaults to `LMSTUDIO_CONTEXT_WINDOW` or `8096`.
+- `--provider`: LLM provider preset: `lmstudio`, `openrouter`, or `openai-compatible`.
+- `--llm-url` / `--lmstudio-url`: OpenAI-compatible API base. Defaults to `LLM_URL`, provider-specific env values, or the local LM Studio URL.
+- `--model`: Model name. Defaults to `LLM_MODEL`, provider-specific env values, `gemma-4-31b-it`, or `google/gemma-4-31b-it` for OpenRouter.
+- `--llm-api-key`: Bearer key for hosted providers. Defaults to `LLM_API_KEY` or `OPENROUTER_API_KEY`.
+- `--openrouter-site-url`: Optional OpenRouter `HTTP-Referer` header.
+- `--openrouter-app-name`: Optional OpenRouter `X-Title` header.
+- `--context-window`: LLM context window used for page budgeting. Defaults to `LLM_CONTEXT_WINDOW`, `LMSTUDIO_CONTEXT_WINDOW`, or `8096`.
 
 Document selection:
 
@@ -271,6 +302,8 @@ Vision and text:
 - `--vision-dpi`: DPI for rendering Paperless preview PDFs into page images.
 - `--max-vision-pages`: Hard cap on rendered pages. `0` means only the context budget decides.
 - `--allow-partial-vision`: Permit apply when not all pages were sent as images.
+- `--pdf-input auto|rendered-images|openrouter-file`: In `auto`, OpenRouter gets PDFs as PDF file inputs, while local providers get rendered page images.
+- `--openrouter-pdf-engine mistral-ocr|cloudflare-ai|native|default`: PDF parser engine for OpenRouter file input. `mistral-ocr` is best for scanned documents; `default` lets OpenRouter choose.
 - `--ocr-source auto|always|never`: In `auto`, Paperless OCR is omitted when all pages fit as images and included only as fallback when they do not. `always` includes Paperless OCR. `never` omits it.
 - `--content-chars`: Paperless OCR characters sent when OCR fallback is used.
 - `--image-token-estimate`: Estimated context tokens consumed by each page image.
@@ -278,10 +311,10 @@ Vision and text:
 
 Classification tuning:
 
-- `--temperature`: LM Studio sampling temperature.
-- `--max-tokens`: Maximum response tokens from LM Studio.
-- `--response-format text|json_schema`: Use `json_schema` only when your LM Studio model and context window handle it reliably.
-- `--rules-first`: Use deterministic rules before LM Studio. Currently this is useful for repetitive REWE eBon receipts.
+- `--temperature`: LLM sampling temperature.
+- `--max-tokens`: Maximum response tokens from the LLM.
+- `--response-format text|json_schema`: Use `json_schema` only when your provider, model, and context window handle it reliably.
+- `--rules-first`: Use deterministic rules before the LLM. Currently this is useful for repetitive REWE eBon receipts.
 - `--replace-tags`: Replace non-Inbox tags with model-selected tags instead of preserving existing non-Inbox tags.
 - `--drop-bulk-unclassified`: Remove the `Bulk Unclassified` tag from the final tag set after a successful classification. This is only tag cleanup; it does not delete documents.
 - `--create-correspondents`: Create missing Paperless correspondents when the model proposes one.
@@ -291,8 +324,8 @@ Classification tuning:
 Runtime:
 
 - `--timeout`: HTTP timeout in seconds.
-- `--retries`: Retries for transient LM Studio errors.
-- `--retry-sleep`: Base sleep between LM Studio retries.
+- `--retries`: Retries for transient LLM errors.
+- `--retry-sleep`: Base sleep between LLM retries.
 - `--sleep`: Delay between documents.
 - `--allow-battery`: Do not pause on macOS battery power.
 - `--power-check-interval`: Recheck interval while paused on battery.

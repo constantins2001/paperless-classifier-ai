@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Classify Paperless Inbox documents with a local LM Studio model.
+"""Classify Paperless Inbox documents with an OpenAI-compatible vision model.
 
 The script is intentionally conservative:
 - It defaults to dry-run mode.
@@ -29,9 +29,11 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
+DEFAULT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
 DEFAULT_OUTPUT_ROOT = "paperless_lmstudio_runs"
 DEFAULT_THRESHOLD = 0.86
 DEFAULT_CONTEXT_WINDOW = 8096
@@ -340,6 +342,12 @@ class VisionImage:
     data_url: str
 
 
+@dataclass(frozen=True)
+class VisionFile:
+    filename: str
+    data_url: str
+
+
 class ResourceCatalog:
     def __init__(
         self,
@@ -536,11 +544,15 @@ class PaperlessClient:
         return self.bytes(f"/api/documents/{doc_id}/preview/")
 
 
-class LMStudioClient:
+class LLMClient:
     def __init__(
         self,
+        provider: str,
         base_url: str,
         model: str,
+        api_key: str | None,
+        openrouter_site_url: str | None,
+        openrouter_app_name: str | None,
         timeout: float,
         temperature: float,
         max_tokens: int,
@@ -548,6 +560,7 @@ class LMStudioClient:
         retries: int,
         retry_sleep: float,
     ) -> None:
+        self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
@@ -556,14 +569,28 @@ class LMStudioClient:
         self.retries = retries
         self.retry_sleep = retry_sleep
         self.http = JsonHttpClient(timeout)
+        self.headers: dict[str, str] = {}
+        if api_key:
+            self.headers["Authorization"] = f"Bearer {api_key}"
+        if provider == "openrouter":
+            if openrouter_site_url:
+                self.headers["HTTP-Referer"] = openrouter_site_url
+            if openrouter_app_name:
+                self.headers["X-Title"] = openrouter_app_name
 
-    def classify(self, messages: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
+    def classify(
+        self,
+        messages: list[dict[str, Any]],
+        plugins: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], str]:
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        if plugins:
+            payload["plugins"] = plugins
         if self.response_format == "json_schema":
             payload["response_format"] = classification_response_format()
         elif self.response_format == "text":
@@ -573,7 +600,12 @@ class LMStudioClient:
         last_error: ClassifierError | None = None
         for attempt in range(self.retries + 1):
             try:
-                data = self.http.request_json("POST", f"{self.base_url}/chat/completions", data=payload)
+                data = self.http.request_json(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    data=payload,
+                )
                 break
             except ClassifierError as exc:
                 last_error = exc
@@ -586,11 +618,11 @@ class LMStudioClient:
                     raise
                 time.sleep(self.retry_sleep * (attempt + 1))
         else:
-            raise last_error or ClassifierError("LM Studio request failed")
+            raise last_error or ClassifierError("LLM request failed")
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ClassifierError(f"Unexpected LM Studio response: {data}") from exc
+            raise ClassifierError(f"Unexpected LLM response: {data}") from exc
         return parse_json_object(content), content
 
 
@@ -725,12 +757,27 @@ def build_user_message(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def build_messages(user_text: str, images: list[VisionImage]) -> list[dict[str, Any]]:
-    if images:
+def build_messages(
+    user_text: str,
+    images: list[VisionImage],
+    files: list[VisionFile] | None = None,
+) -> list[dict[str, Any]]:
+    files = files or []
+    if images or files:
         content: Any = [{"type": "text", "text": user_text}]
         content.extend(
             {"type": "image_url", "image_url": {"url": image.data_url}}
             for image in images
+        )
+        content.extend(
+            {
+                "type": "file",
+                "file": {
+                    "filename": file.filename,
+                    "file_data": file.data_url,
+                },
+            }
+            for file in files
         )
     else:
         content = user_text
@@ -765,6 +812,74 @@ def should_omit_paperless_ocr(
     )
     page_budget, _ = vision_page_budget(args, metadata_text, total_pages)
     return page_budget >= total_pages
+
+
+def openrouter_pdf_plugins(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.openrouter_pdf_engine == "default":
+        return []
+    return [
+        {
+            "id": "file-parser",
+            "pdf": {
+                "engine": args.openrouter_pdf_engine,
+            },
+        }
+    ]
+
+
+def build_openrouter_pdf_file_input(
+    doc: dict[str, Any],
+    paperless: PaperlessClient,
+    args: argparse.Namespace,
+) -> tuple[list[VisionFile], dict[str, Any], list[dict[str, Any]]]:
+    doc_id = int(doc["id"])
+    try:
+        raw, content_type = paperless.preview_bytes(doc_id)
+    except Exception as exc:  # noqa: BLE001 - keep classification auditable.
+        return [], {
+            "enabled": True,
+            "source": "openrouter_pdf_file_unavailable",
+            "page_count": positive_int(doc.get("page_count")),
+            "included_pages": [],
+            "omitted_pages": [],
+            "all_pages_included": False,
+            "image_count": 0,
+            "file_count": 0,
+            "warnings": [f"could not fetch Paperless preview for OpenRouter PDF input: {exc}"],
+        }, []
+
+    media_type = content_type.split(";", 1)[0].strip().casefold()
+    if media_type != "application/pdf" and not raw.startswith(b"%PDF"):
+        return [], {
+            "enabled": True,
+            "source": "openrouter_pdf_file_unavailable",
+            "page_count": positive_int(doc.get("page_count")),
+            "included_pages": [],
+            "omitted_pages": [],
+            "all_pages_included": False,
+            "image_count": 0,
+            "file_count": 0,
+            "warnings": [f"Paperless preview content type {content_type!r} is not a PDF"],
+        }, []
+
+    page_count = positive_int(doc.get("page_count"))
+    included_pages = list(range(1, page_count + 1)) if page_count else []
+    filename = str(doc.get("original_file_name") or f"paperless-{doc_id}.pdf")
+    if not filename.casefold().endswith(".pdf"):
+        filename = f"{filename}.pdf"
+    return [VisionFile(filename=filename, data_url=data_url("application/pdf", raw))], {
+        "enabled": True,
+        "source": "openrouter_pdf_file",
+        "renderer": "OpenRouter file-parser",
+        "pdf_engine": args.openrouter_pdf_engine,
+        "page_count": page_count,
+        "included_pages": included_pages,
+        "omitted_pages": [],
+        "all_pages_included": True,
+        "image_count": 0,
+        "file_count": 1,
+        "warnings": [],
+    }, openrouter_pdf_plugins(args)
 
 
 def render_pdf_vision_images(
@@ -913,8 +1028,8 @@ def vision_review_warnings(vision: dict[str, Any] | None, args: argparse.Namespa
     if not isinstance(vision, dict) or not vision.get("enabled"):
         return ["vision enabled but audit/classification has no vision evidence"]
     warnings = list(vision.get("warnings") or [])
-    if not vision.get("image_count"):
-        warnings.append("vision enabled but no images were sent")
+    if not vision.get("image_count") and not vision.get("file_count"):
+        warnings.append("vision enabled but no images or files were sent")
     if not vision.get("all_pages_included") and not args.allow_partial_vision:
         warnings.append("all-page vision was not available")
     return sorted(set(str(warning) for warning in warnings if warning))
@@ -1244,9 +1359,10 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
     ]
 
     lines = [
-        "# Paperless LM Studio Classification Run",
+        "# Paperless AI Classification Run",
         "",
         f"- Mode: {'apply' if args.apply else 'dry-run'}",
+        f"- Provider: `{args.provider}`",
         f"- Model: `{args.model}`",
         f"- Threshold: `{args.threshold}`",
         f"- Documents considered: `{len(records)}`",
@@ -1280,9 +1396,14 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
         vision = c.get("vision") or {}
         vision_suffix = ""
         if vision.get("enabled"):
-            vision_suffix = (
-                f" | vision `{vision.get('image_count', 0)}/{vision.get('page_count') or '?'} pages`"
-            )
+            if vision.get("file_count"):
+                vision_suffix = (
+                    f" | vision `PDF file, {vision.get('page_count') or '?'} pages`"
+                )
+            else:
+                vision_suffix = (
+                    f" | vision `{vision.get('image_count', 0)}/{vision.get('page_count') or '?'} pages`"
+                )
         lines.append(
             f"- `{record['document_id']}`: {c.get('title')} | company `{c.get('correspondent_name')}` | type `{c.get('document_type_name')}` | date `{c.get('created')}` | confidence `{c.get('confidence')}`{vision_suffix}"
         )
@@ -1292,7 +1413,7 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
 def classify_one(
     doc: dict[str, Any],
     paperless: PaperlessClient,
-    lmstudio: LMStudioClient,
+    llm: LLMClient,
     catalog: ResourceCatalog,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -1301,35 +1422,43 @@ def classify_one(
         raw_source = "rule"
     else:
         raw = None
-        raw_source = "lmstudio"
+        raw_source = args.provider
 
     raw_text = None
     if raw is None:
-        omit_paperless_ocr = should_omit_paperless_ocr(doc, catalog, args)
-        paperless_ocr = None if omit_paperless_ocr else str(doc.get("content") or "")
-        ocr_policy = (
-            "omitted_because_all_pages_fit_in_vision_context"
-            if omit_paperless_ocr
-            else "included_as_fallback_or_partial_vision_context"
+        images: list[VisionImage] = []
+        files: list[VisionFile] = []
+        plugins: list[dict[str, Any]] = []
+        use_openrouter_pdf = (
+            args.vision
+            and args.provider == "openrouter"
+            and args.pdf_input in {"auto", "openrouter-file"}
         )
-        preliminary_user_text = build_user_message(
-            doc,
-            catalog,
-            args.content_chars,
-            paperless_ocr,
-            ocr_policy,
-            {"enabled": args.vision, "requested_pages": "all"},
-        )
-        images, vision = build_vision_inputs(doc, paperless, args, preliminary_user_text)
-        if (
-            omit_paperless_ocr
-            and args.ocr_source == "auto"
-            and args.vision
-            and not vision.get("all_pages_included")
-        ):
-            omit_paperless_ocr = False
-            paperless_ocr = str(doc.get("content") or "")
-            ocr_policy = "included_because_all_page_vision_was_not_available"
+        if use_openrouter_pdf:
+            files, vision, plugins = build_openrouter_pdf_file_input(doc, paperless, args)
+            if files:
+                paperless_ocr = None if args.ocr_source != "always" else str(doc.get("content") or "")
+                ocr_policy = (
+                    "included_because_ocr_source_always"
+                    if paperless_ocr is not None
+                    else "omitted_because_openrouter_pdf_input_includes_all_pages"
+                )
+            else:
+                paperless_ocr = str(doc.get("content") or "")
+                ocr_policy = "included_because_openrouter_pdf_input_was_not_available"
+        else:
+            vision = {"enabled": args.vision, "requested_pages": "all", "warnings": []}
+            paperless_ocr = None
+            ocr_policy = "pending"
+
+        if not files:
+            omit_paperless_ocr = should_omit_paperless_ocr(doc, catalog, args)
+            paperless_ocr = None if omit_paperless_ocr else str(doc.get("content") or "")
+            ocr_policy = (
+                "omitted_because_all_pages_fit_in_vision_context"
+                if omit_paperless_ocr
+                else "included_as_fallback_or_partial_vision_context"
+            )
             preliminary_user_text = build_user_message(
                 doc,
                 catalog,
@@ -1339,6 +1468,23 @@ def classify_one(
                 {"enabled": args.vision, "requested_pages": "all"},
             )
             images, vision = build_vision_inputs(doc, paperless, args, preliminary_user_text)
+            if (
+                omit_paperless_ocr
+                and args.ocr_source == "auto"
+                and args.vision
+                and not vision.get("all_pages_included")
+            ):
+                paperless_ocr = str(doc.get("content") or "")
+                ocr_policy = "included_because_all_page_vision_was_not_available"
+                preliminary_user_text = build_user_message(
+                    doc,
+                    catalog,
+                    args.content_chars,
+                    paperless_ocr,
+                    ocr_policy,
+                    {"enabled": args.vision, "requested_pages": "all"},
+                )
+                images, vision = build_vision_inputs(doc, paperless, args, preliminary_user_text)
         user_text = build_user_message(
             doc,
             catalog,
@@ -1351,9 +1497,9 @@ def classify_one(
                 if key not in {"warnings", "budget"}
             },
         )
-        messages = build_messages(user_text, images)
-        raw, raw_text = lmstudio.classify(messages)
-        raw_source = "lmstudio"
+        messages = build_messages(user_text, images, files)
+        raw, raw_text = llm.classify(messages, plugins)
+        raw_source = args.provider
     else:
         vision = {"enabled": False, "source": "rule", "warnings": []}
 
@@ -1374,6 +1520,8 @@ def run(args: argparse.Namespace) -> int:
         raise ClassifierError("Set PAPERLESS_URL or pass --paperless-url")
     if not args.paperless_token:
         raise ClassifierError("Set PAPERLESS_TOKEN or pass --paperless-token")
+    if args.provider == "openrouter" and not args.llm_api_key:
+        raise ClassifierError("Set OPENROUTER_API_KEY or pass --llm-api-key for OpenRouter")
 
     output_dir = Path(args.output_dir or Path(DEFAULT_OUTPUT_ROOT) / now_stamp())
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1381,9 +1529,13 @@ def run(args: argparse.Namespace) -> int:
     audit_md = output_dir / "summary.md"
 
     paperless = PaperlessClient(args.paperless_url, args.paperless_token, args.timeout)
-    lmstudio = LMStudioClient(
-        args.lmstudio_url,
+    llm = LLMClient(
+        args.provider,
+        args.llm_url,
         args.model,
+        args.llm_api_key,
+        args.openrouter_site_url,
+        args.openrouter_app_name,
         args.timeout,
         args.temperature,
         args.max_tokens,
@@ -1426,7 +1578,7 @@ def run(args: argparse.Namespace) -> int:
             doc = paperless.document(doc_id)
             record["original_title"] = doc.get("title")
             record["original_tags"] = doc.get("tags", [])
-            normalized = classify_one(doc, paperless, lmstudio, catalog, args)
+            normalized = classify_one(doc, paperless, llm, catalog, args)
             record["classification"] = normalized
 
             if normalized["delete_candidate"]:
@@ -1577,19 +1729,53 @@ def self_test() -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     load_env_file(Path(".env"))
+    provider_default = os.getenv("LLM_PROVIDER", "lmstudio")
+    llm_url_env = os.getenv("LLM_URL") or os.getenv("OPENROUTER_URL") or os.getenv("LMSTUDIO_URL")
+    model_env = os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL") or os.getenv("LMSTUDIO_MODEL")
+    llm_api_key_default = os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    if provider_default == "openrouter":
+        llm_url_default = llm_url_env or DEFAULT_OPENROUTER_URL
+        model_default = model_env or DEFAULT_OPENROUTER_MODEL
+    else:
+        llm_url_default = llm_url_env or DEFAULT_LMSTUDIO_URL
+        model_default = model_env or DEFAULT_MODEL
+
     parser = argparse.ArgumentParser(
-        description="Classify Paperless Inbox documents with LM Studio.",
+        description="Classify Paperless Inbox documents with an OpenAI-compatible LLM.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--paperless-url", default=os.getenv("PAPERLESS_URL"), help="Paperless-ngx base URL")
     parser.add_argument("--paperless-token", default=os.getenv("PAPERLESS_TOKEN"), help="Paperless API token")
     parser.add_argument(
-        "--lmstudio-url",
-        default=os.getenv("LMSTUDIO_URL", DEFAULT_LMSTUDIO_URL),
-        help="OpenAI-compatible LM Studio API base URL",
+        "--provider",
+        choices=["lmstudio", "openrouter", "openai-compatible"],
+        default=provider_default,
+        help="LLM provider preset",
     )
-    parser.add_argument("--model", default=os.getenv("LMSTUDIO_MODEL", DEFAULT_MODEL), help="LM Studio model name")
+    parser.add_argument(
+        "--llm-url",
+        "--lmstudio-url",
+        dest="llm_url",
+        default=llm_url_default,
+        help="OpenAI-compatible API base URL",
+    )
+    parser.add_argument("--model", default=model_default, help="LLM model name")
+    parser.add_argument(
+        "--llm-api-key",
+        default=llm_api_key_default,
+        help="Bearer API key for hosted OpenAI-compatible providers",
+    )
+    parser.add_argument(
+        "--openrouter-site-url",
+        default=os.getenv("OPENROUTER_SITE_URL"),
+        help="Optional OpenRouter HTTP-Referer header",
+    )
+    parser.add_argument(
+        "--openrouter-app-name",
+        default=os.getenv("OPENROUTER_APP_NAME", "paperless-classifier-ai"),
+        help="Optional OpenRouter X-Title header",
+    )
     parser.add_argument("--label", default="Inbox", help="Inbox tag name if no is_inbox_tag exists")
     parser.add_argument("--limit", type=int, default=10, help="Maximum documents to process; 0 means all")
     parser.add_argument("--id", dest="ids", action="append", help="Classify a specific document ID")
@@ -1597,13 +1783,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--page-size", type=int, default=100, help="Paperless API page size")
     parser.add_argument("--ordering", default="-created", help="Paperless document ordering")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="Minimum confidence for apply")
-    parser.add_argument("--temperature", type=float, default=0.1, help="LM Studio sampling temperature")
-    parser.add_argument("--max-tokens", type=int, default=1200, help="Maximum LM Studio response tokens")
+    parser.add_argument("--temperature", type=float, default=0.1, help="LLM sampling temperature")
+    parser.add_argument("--max-tokens", type=int, default=1200, help="Maximum LLM response tokens")
     parser.add_argument(
         "--context-window",
         type=int,
-        default=int(os.getenv("LMSTUDIO_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)),
-        help="LM Studio context window used for image page budgeting",
+        default=int(os.getenv("LLM_CONTEXT_WINDOW") or os.getenv("LMSTUDIO_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)),
+        help="LLM context window used for image page budgeting",
     )
     parser.add_argument(
         "--context-safety-tokens",
@@ -1621,12 +1807,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--response-format",
         choices=["json_schema", "text"],
         default="text",
-        help="Use json_schema only when LM Studio is loaded with enough context",
+        help="Use json_schema only when your provider/model handles it reliably",
     )
     parser.add_argument("--content-chars", type=int, default=2500, help="Paperless OCR characters sent when OCR fallback is used")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds")
-    parser.add_argument("--retries", type=int, default=2, help="Retries for transient LM Studio errors")
-    parser.add_argument("--retry-sleep", type=float, default=3.0, help="Base sleep between LM Studio retries")
+    parser.add_argument("--retries", type=int, default=2, help="Retries for transient LLM errors")
+    parser.add_argument("--retry-sleep", type=float, default=3.0, help="Base sleep between LLM retries")
     parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between documents")
     parser.add_argument("--allow-battery", action="store_true", help="Do not pause when macOS reports Battery Power")
     parser.add_argument("--power-check-interval", type=float, default=300.0, help="Seconds between AC-power checks while paused")
@@ -1645,7 +1831,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--vision",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Send rendered Paperless page images to LM Studio; use --no-vision to disable",
+        help="Send rendered Paperless page images to the LLM; use --no-vision to disable",
     )
     parser.add_argument(
         "--vision-dpi",
@@ -1665,18 +1851,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Allow apply when only a representative subset of pages was sent",
     )
     parser.add_argument(
+        "--pdf-input",
+        choices=["auto", "rendered-images", "openrouter-file"],
+        default="auto",
+        help="PDF input strategy: OpenRouter file input in auto/openrouter-file, rendered page images otherwise",
+    )
+    parser.add_argument(
+        "--openrouter-pdf-engine",
+        choices=["mistral-ocr", "cloudflare-ai", "native", "default"],
+        default=os.getenv("OPENROUTER_PDF_ENGINE", "mistral-ocr"),
+        help="OpenRouter file-parser PDF engine when PDF file input is used",
+    )
+    parser.add_argument(
         "--ocr-source",
         choices=["auto", "always", "never"],
         default="auto",
         help="Use Paperless OCR always, never, or only when not all pages fit as images",
     )
-    parser.add_argument("--rules-first", action="store_true", help="Use deterministic vendor rules before LM Studio")
+    parser.add_argument("--rules-first", action="store_true", help="Use deterministic vendor rules before the LLM")
     parser.add_argument("--replace-tags", action="store_true", help="Replace non-Inbox tags instead of preserving them")
     parser.add_argument("--drop-bulk-unclassified", action="store_true", help="Drop Bulk Unclassified after classification")
     parser.add_argument("--create-correspondents", action="store_true", help="Create missing correspondent resources")
     parser.add_argument("--create-document-types", action="store_true", help="Create missing document type resources")
     parser.add_argument("--self-test", action="store_true", help="Run local parser sanity checks")
     args = parser.parse_args(argv)
+    if args.provider == "openrouter":
+        if not llm_url_env and args.llm_url == DEFAULT_LMSTUDIO_URL:
+            args.llm_url = DEFAULT_OPENROUTER_URL
+        if not model_env and args.model == DEFAULT_MODEL:
+            args.model = DEFAULT_OPENROUTER_MODEL
     if args.limit is not None and args.limit < 1:
         args.limit = None
     if args.context_window < 1:
@@ -1689,6 +1892,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--vision-dpi must be positive")
     if args.max_vision_pages < 0:
         parser.error("--max-vision-pages must not be negative")
+    if args.pdf_input == "openrouter-file" and args.provider != "openrouter":
+        parser.error("--pdf-input openrouter-file requires --provider openrouter")
     return args
 
 
