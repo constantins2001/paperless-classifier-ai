@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
@@ -43,9 +43,13 @@ DEFAULT_IMAGE_TOKEN_ESTIMATE = 768
 DEFAULT_VISION_DPI = 120
 DEFAULT_WORKERS = 1
 MAX_TITLE_LEN = 128
+# Terminal statuses for the local audit ledger. `updated_kept_inbox` deliberately
+# stays here: the document still has Inbox in Paperless, but the local run has
+# already applied the best available metadata and left it for human review.
 RESUME_SKIP_STATUSES = {
     "dry_run_ready",
     "updated",
+    "updated_kept_inbox",
     "skipped_delete_candidate",
     "skipped_needs_review",
 }
@@ -1285,15 +1289,40 @@ def create_missing_resources(
         )
 
 
-def build_patch(normalized: dict[str, Any]) -> dict[str, Any]:
-    return {
+def build_patch(
+    normalized: dict[str, Any],
+    *,
+    remove_inbox_tags: bool = True,
+    inbox_tag_id: int | None = None,
+) -> dict[str, Any]:
+    tag_ids = sorted(set(int(tag_id) for tag_id in normalized.get("tag_ids", [])))
+    if not remove_inbox_tags and inbox_tag_id:
+        tag_ids = sorted(set(tag_ids + [inbox_tag_id]))
+    patch = {
         "correspondent": normalized["correspondent_id"],
         "document_type": normalized["document_type_id"],
         "created": normalized["created"],
         "title": normalized["title"],
-        "tags": normalized["tag_ids"],
-        "remove_inbox_tags": True,
+        "tags": tag_ids,
     }
+    if remove_inbox_tags:
+        patch["remove_inbox_tags"] = True
+    return patch
+
+
+def has_patchable_metadata(normalized: dict[str, Any]) -> tuple[bool, str]:
+    if normalized.get("delete_candidate"):
+        return False, "delete candidate"
+    if not normalized.get("correspondent_id") or not normalized.get("document_type_id"):
+        return False, "missing IDs"
+    if not is_date(normalized.get("created")):
+        return False, "invalid created date"
+    if not normalized.get("title"):
+        return False, "missing title"
+    tag_ids = normalized.get("tag_ids")
+    if not isinstance(tag_ids, list) or any(positive_int(tag_id) is None for tag_id in tag_ids):
+        return False, "invalid tags"
+    return True, "patchable"
 
 
 def should_apply(normalized: dict[str, Any], args: argparse.Namespace) -> tuple[bool, str]:
@@ -1303,13 +1332,7 @@ def should_apply(normalized: dict[str, Any], args: argparse.Namespace) -> tuple[
         return False, "needs review"
     if normalized["confidence"] < args.threshold and not args.force:
         return False, f"confidence below threshold {args.threshold}"
-    if not normalized["correspondent_id"] or not normalized["document_type_id"]:
-        return False, "missing IDs"
-    if not is_date(normalized["created"]):
-        return False, "invalid created date"
-    if not normalized["title"]:
-        return False, "missing title"
-    return True, "ready"
+    return has_patchable_metadata(normalized)
 
 
 def write_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -1367,6 +1390,7 @@ def latest_by_document(records: list[dict[str, Any]]) -> dict[int, dict[str, Any
 def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.Namespace) -> None:
     records = list(latest_by_document(records).values())
     updated = [r for r in records if r["status"] == "updated"]
+    updated_kept_inbox = [r for r in records if r["status"] == "updated_kept_inbox"]
     dry_ready = [r for r in records if r["status"] == "dry_run_ready"]
     skipped = [r for r in records if r["status"].startswith("skipped")]
     failed = [r for r in records if r["status"] == "failed"]
@@ -1387,6 +1411,7 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
         f"- Threshold: `{args.threshold}`",
         f"- Documents considered: `{len(records)}`",
         f"- Updated: `{len(updated)}`",
+        f"- Updated, kept Inbox: `{len(updated_kept_inbox)}`",
         f"- Dry-run ready: `{len(dry_ready)}`",
         f"- Skipped: `{len(skipped)}`",
         f"- Failed: `{len(failed)}`",
@@ -1411,7 +1436,7 @@ def markdown_summary(path: Path, records: list[dict[str, Any]], args: argparse.N
             lines.append(f"- `{record['document_id']}`: {record.get('original_title')} - {reason}{suffix}")
         lines.append("")
     lines.extend(["## Successful classifications", ""])
-    for record in updated + dry_ready:
+    for record in updated + updated_kept_inbox + dry_ready:
         c = record.get("classification", {})
         vision = c.get("vision") or {}
         vision_suffix = ""
@@ -1579,6 +1604,7 @@ def run(args: argparse.Namespace) -> int:
         ids = paperless.inbox_ids(inbox.id, args.page_size, args.ordering, args.query, args.limit)
 
     existing_records: list[dict[str, Any]] = []
+    resume_skipped = 0
     if args.resume:
         existing_records = read_jsonl(audit_jsonl)
         latest = latest_by_document(existing_records)
@@ -1587,11 +1613,13 @@ def run(args: argparse.Namespace) -> int:
             for doc_id, record in latest.items()
             if record.get("status") in RESUME_SKIP_STATUSES
         }
+        resume_skipped = sum(1 for doc_id in ids if doc_id in skip_ids)
         ids = [doc_id for doc_id in ids if doc_id not in skip_ids]
 
     print(f"Run directory: {output_dir}", flush=True)
     if args.resume:
         print(f"Resume: {len(existing_records)} existing audit records", flush=True)
+        print(f"Resume skipped: {resume_skipped} terminal documents", flush=True)
     print(f"Documents queued: {len(ids)}", flush=True)
     print(f"Mode: {'APPLY' if args.apply else 'DRY-RUN'}", flush=True)
     print(f"Workers: {args.workers}", flush=True)
@@ -1613,10 +1641,26 @@ def run(args: argparse.Namespace) -> int:
                 if args.apply:
                     create_missing_resources(normalized, paperless, catalog, args)
                 ready, reason = should_apply(normalized, args)
+                patchable, patchable_reason = has_patchable_metadata(normalized)
                 record["patch"] = build_patch(normalized) if ready else None
+                record["review_patch"] = (
+                    build_patch(
+                        normalized,
+                        remove_inbox_tags=False,
+                        inbox_tag_id=args.inbox_tag_id,
+                    )
+                    if not ready and patchable
+                    else None
+                )
                 if not ready:
-                    record["status"] = "skipped_needs_review"
-                    record["skip_reason"] = reason
+                    if args.apply and args.apply_review_metadata and patchable:
+                        result = paperless.patch(f"/api/documents/{doc_id}/", record["review_patch"])
+                        record["status"] = "updated_kept_inbox"
+                        record["skip_reason"] = reason
+                        record["updated_title"] = result.get("title")
+                    else:
+                        record["status"] = "skipped_needs_review"
+                        record["skip_reason"] = reason if patchable else patchable_reason
                 elif args.apply:
                     result = paperless.patch(f"/api/documents/{doc_id}/", record["patch"])
                     record["status"] = "updated"
@@ -1681,11 +1725,27 @@ def apply_from_audit(args: argparse.Namespace) -> int:
     inbox = catalog.inbox_tag(args.label)
     args.inbox_tag_id = inbox.id
 
-    candidates = [
-        record
-        for record in source_records.values()
-        if record.get("status") == "dry_run_ready" and isinstance(record.get("patch"), dict)
-    ]
+    candidates = []
+    for record in source_records.values():
+        if record.get("status") == "dry_run_ready" and isinstance(record.get("patch"), dict):
+            candidates.append(record)
+        elif (
+            args.apply_review_metadata
+            and record.get("status") == "skipped_needs_review"
+            and isinstance(record.get("review_patch"), dict)
+        ):
+            candidates.append(record)
+        elif args.apply_review_metadata and record.get("status") == "skipped_needs_review":
+            classification = record.get("classification") or {}
+            patchable, _ = has_patchable_metadata(classification)
+            if patchable:
+                record = dict(record)
+                record["review_patch"] = build_patch(
+                    classification,
+                    remove_inbox_tags=False,
+                    inbox_tag_id=args.inbox_tag_id,
+                )
+                candidates.append(record)
     candidates.sort(key=lambda record: int(record["document_id"]))
     if args.limit:
         candidates = candidates[: args.limit]
@@ -1702,7 +1762,10 @@ def apply_from_audit(args: argparse.Namespace) -> int:
             "index": index,
             "original_title": source_record.get("original_title"),
             "classification": source_record.get("classification"),
-            "patch": source_record.get("patch"),
+            "patch": source_record.get("patch")
+            if source_record.get("status") == "dry_run_ready"
+            else source_record.get("review_patch"),
+            "review_metadata": source_record.get("status") == "skipped_needs_review",
         }
         try:
             wait_for_ac_power(args)
@@ -1710,6 +1773,18 @@ def apply_from_audit(args: argparse.Namespace) -> int:
             if classification.get("delete_candidate"):
                 record["status"] = "skipped_delete_candidate"
                 record["skip_reason"] = classification.get("delete_reason") or "delete candidate"
+            elif record["review_metadata"]:
+                current = paperless.document(doc_id)
+                record["original_title"] = current.get("title")
+                record["original_tags"] = current.get("tags", [])
+                if inbox.id not in current.get("tags", []):
+                    record["status"] = "skipped_already_not_in_inbox"
+                    record["skip_reason"] = "Inbox tag already absent"
+                else:
+                    result = paperless.patch(f"/api/documents/{doc_id}/", record["patch"])
+                    record["status"] = "updated_kept_inbox"
+                    record["updated_title"] = result.get("title")
+                    record["skip_reason"] = source_record.get("skip_reason") or "review metadata applied"
             elif float(classification.get("confidence") or 0) < args.threshold and not args.force:
                 record["status"] = "skipped_needs_review"
                 record["skip_reason"] = f"confidence below threshold {args.threshold}"
@@ -1795,6 +1870,23 @@ def self_test() -> int:
     assert safe_title("", "Fallback") == "Fallback"
     assert select_representative_pages(5, 3) == [0, 2, 4]
     assert select_representative_pages(2, 10) == [0, 1]
+    sample_normalized = {
+        "correspondent_id": 1,
+        "document_type_id": 2,
+        "created": "2026-05-02",
+        "title": "Sample",
+        "tag_ids": [3],
+        "delete_candidate": False,
+    }
+    assert has_patchable_metadata(sample_normalized) == (True, "patchable")
+    assert has_patchable_metadata({**sample_normalized, "tag_ids": ["bad"]}) == (
+        False,
+        "invalid tags",
+    )
+    assert build_patch(sample_normalized)["remove_inbox_tags"] is True
+    review_patch = build_patch(sample_normalized, remove_inbox_tags=False, inbox_tag_id=9)
+    assert "remove_inbox_tags" not in review_patch
+    assert review_patch["tags"] == [3, 9]
     print("Self-test passed", flush=True)
     return 0
 
@@ -1904,6 +1996,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Skip already audited documents in output-dir/audit.jsonl")
     parser.add_argument("--apply-audit", help="Apply dry-run-ready patches from an audit.jsonl without reclassifying")
     parser.add_argument("--apply", action="store_true", help="Patch Paperless records. Omit for dry-run.")
+    parser.add_argument(
+        "--apply-review-metadata",
+        action="store_true",
+        help="In apply mode, patch review-required metadata but keep the Inbox tag",
+    )
     parser.add_argument("--force", action="store_true", help="Apply even when needs_review/confidence gate fails")
     parser.add_argument(
         "--vision",

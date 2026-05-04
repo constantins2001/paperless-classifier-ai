@@ -242,6 +242,51 @@ The script applies only classifications that:
 When applying, it patches metadata and removes the Inbox tag in the same
 Paperless update.
 
+If you want useful metadata updates but still want review-required documents to
+remain in Inbox, add `--apply-review-metadata`:
+
+```bash
+python3 paperless_lmstudio_classifier.py \
+  --limit 10 \
+  --threshold 0.86 \
+  --rules-first \
+  --drop-bulk-unclassified \
+  --apply \
+  --apply-review-metadata
+```
+
+With that flag, fully safe classifications are applied normally and lose Inbox.
+Review-required classifications with valid correspondent, document type, date,
+title, and tags are patched but keep Inbox. Delete candidates and records with
+missing IDs or invalid dates are still skipped.
+
+To prevent those Inbox-kept documents from being classified again on every run,
+use a stable `--output-dir` together with `--resume`. The audit file is the local
+ledger: once a document is recorded as `updated_kept_inbox`, future runs that use
+the same directory skip it even though the Inbox tag is still present in
+Paperless.
+
+The same flag works with `--apply-audit` when the dry-run audit contains
+`review_patch` records:
+
+```bash
+python3 paperless_lmstudio_classifier.py \
+  --apply-audit paperless_lmstudio_runs/full-dryrun/audit.jsonl \
+  --apply-review-metadata \
+  --threshold 0.86
+```
+
+If that audit is feeding a recurring launchd job, write the apply result into the
+same stable run directory used by launchd:
+
+```bash
+python3 paperless_lmstudio_classifier.py \
+  --apply-audit paperless_lmstudio_runs/full-dryrun/audit.jsonl \
+  --apply-review-metadata \
+  --threshold 0.86 \
+  --output-dir paperless_lmstudio_runs/launchd-local
+```
+
 ## Useful Modes
 
 Classify specific documents:
@@ -348,12 +393,13 @@ Document selection:
 - `--query`: Paperless full-text search filter.
 - `--page-size`: Paperless API page size.
 - `--ordering`: Paperless document ordering, for example `-created`.
-- `--resume`: Skip documents that already have terminal records in the chosen `audit.jsonl`.
+- `--resume`: Skip documents that already have terminal records in the chosen `audit.jsonl`, including `updated_kept_inbox`.
 
 Apply behavior:
 
 - `--apply`: Patch Paperless metadata and remove the Inbox tag. Without it, the run is dry-run only.
 - `--apply-audit PATH`: Apply exact `dry_run_ready` patches from an existing `audit.jsonl` without rerunning the model.
+- `--apply-review-metadata`: In apply mode, patch review-required metadata but keep the Inbox tag.
 - `--force`: Override confidence, review, and safety gates. This is intentionally sharp.
 - `--threshold`: Minimum confidence required for apply.
 
@@ -516,6 +562,12 @@ paperless_lmstudio_classifier.py \
 The classifier still uses its normal battery behavior: it pauses on battery and
 continues on AC power. The launchd wrapper prevents overlapping scheduled runs
 while one run is active or paused.
+
+Keep `PAPERLESS_AI_RUN_DIR` stable for recurring jobs. The wrapper always passes
+`--resume`, so this directory's `audit.jsonl` is what prevents documents that
+were already updated, skipped, or updated-but-kept-in-Inbox from being sent back
+to the model on every poll. Use a new run directory only when you intentionally
+want a fresh classification pass.
 
 Customize install-time settings with environment variables:
 
