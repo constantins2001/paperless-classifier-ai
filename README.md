@@ -243,6 +243,12 @@ The script applies only classifications that:
 When applying, it patches metadata and removes the Inbox tag in the same
 Paperless update.
 
+For generic AGB, terms, insurance conditions, manuals, and similar documents,
+the classifier treats broad version dates such as `Stand`, `Fassung`, or
+validity dates as part of the title/context, not as the document date. If no
+personal delivery, issue, letter, signature, submission, or transaction date is
+visible, it falls back to the Paperless metadata date.
+
 If you want useful metadata updates but still want review-required documents to
 remain in Inbox, add `--apply-review-metadata`:
 

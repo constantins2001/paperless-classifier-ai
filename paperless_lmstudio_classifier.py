@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
@@ -708,7 +708,7 @@ def classification_response_format() -> dict[str, Any]:
 def build_system_prompt() -> str:
     return """Classify Paperless-ngx documents. Return one strict JSON object and no prose.
 
-Rules: When page images are attached, read the images directly and treat visual text as the source of truth. Paperless OCR content may be omitted, partial, or only a fallback. company=sender/issuer/merchant/court/employer/provider, not recipient or employee. For work timesheets use the employer/client company, not the worker name. created=document issue/signature/submission/transaction/letter date, not import date. If a document covers a period/year, put that period in the title; do not use period end such as Dec 31 as created when a signing/issue/submission date is visible. Use existing IDs when possible. Preserve an existing correspondent/type when it is semantically compatible. Invoice/receipt/eBon/bill => Rechnung if available. Tags must be existing IDs, but never include Inbox. Keep Email Attachment for emails. If no existing company/type fits, id null + create true. Never delete; mark delete_candidate only. needs_review true if weak/ambiguous/missing IDs. Confidence means safe to apply.
+Rules: When page images are attached, read the images directly and treat visual text as the source of truth. Paperless OCR content may be omitted, partial, or only a fallback. company=sender/issuer/merchant/court/employer/provider, not recipient or employee. For work timesheets use the employer/client company, not the worker name. created=document issue/signature/submission/transaction/letter/delivery date. If the document is generic terms/conditions, AGB, insurance conditions, product terms, a manual, or similar, dates like "Stand", "Fassung", "version", or validity dates for everyone are not document-specific dates; use the Paperless metadata created date instead unless a personal delivery/letter/issue/signature/submission/transaction date is visible. If no document-specific date can be found, use the Paperless metadata created date. If a document covers a period/year, put that period in the title; do not use period end such as Dec 31 as created when a signing/issue/submission date is visible. Use existing IDs when possible. Preserve an existing correspondent/type when it is semantically compatible. Invoice/receipt/eBon/bill => Rechnung if available. Tags must be existing IDs, but never include Inbox. Keep Email Attachment for emails. If no existing company/type fits, id null + create true. Never delete; mark delete_candidate only. needs_review true if weak/ambiguous/missing IDs. Confidence means safe to apply.
 
 Required JSON shape:
 {
@@ -749,6 +749,8 @@ def build_user_message(
             "id": doc.get("id"),
             "title": doc.get("title"),
             "created": doc.get("created"),
+            "created_date": doc.get("created_date"),
+            "added": doc.get("added"),
             "original_file_name": doc.get("original_file_name"),
             "mime_type": doc.get("mime_type"),
             "page_count": doc.get("page_count"),
@@ -1690,10 +1692,14 @@ def run(args: argparse.Namespace) -> int:
                 )
                 if not ready:
                     if args.apply and args.apply_review_metadata and patchable:
-                        result = paperless.patch(f"/api/documents/{doc_id}/", record["review_patch"])
-                        record["status"] = "updated_kept_inbox"
-                        record["skip_reason"] = reason
-                        record["updated_title"] = result.get("title")
+                        if args.inbox_tag_id not in doc.get("tags", []):
+                            record["status"] = "skipped_already_not_in_inbox"
+                            record["skip_reason"] = "Inbox tag already absent"
+                        else:
+                            result = paperless.patch(f"/api/documents/{doc_id}/", record["review_patch"])
+                            record["status"] = "updated_kept_inbox"
+                            record["skip_reason"] = reason
+                            record["updated_title"] = result.get("title")
                     else:
                         record["status"] = "skipped_needs_review"
                         record["skip_reason"] = reason if patchable else patchable_reason
@@ -1953,6 +1959,26 @@ def self_test() -> int:
         "skipped_unreadable",
         "document closed or encrypted",
     )
+    system_prompt = build_system_prompt()
+    assert "generic terms/conditions" in system_prompt
+    assert "Paperless metadata created date" in system_prompt
+    catalog = ResourceCatalog([], [], [{"id": 9, "name": "Inbox", "is_inbox_tag": True}])
+    user_payload = json.loads(
+        build_user_message(
+            {
+                "id": 1,
+                "created": "2026-03-05",
+                "created_date": "2026-03-05",
+                "added": "2026-03-05T13:10:54+01:00",
+            },
+            catalog,
+            100,
+            "",
+            "fallback",
+        )
+    )
+    assert user_payload["document"]["created_date"] == "2026-03-05"
+    assert user_payload["document"]["added"].startswith("2026-03-05")
     assert resume_seed_record(
         {"document_id": 1, "status": "failed", "error": "document closed or encrypted"},
         Path("audit.jsonl"),
