@@ -473,6 +473,101 @@ PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Use `--allow-battery` in cron only if you explicitly want processing while
 unplugged.
 
+## macOS launchd
+
+For a Mac that comes and goes from sleep, `launchd` is usually better than cron.
+The repo includes a setup script that installs a LaunchAgent which polls every 5
+minutes by default, uses a lock so runs cannot overlap, writes combined logs,
+and sends a macOS notification when the wrapper or classifier exits with an
+error.
+
+Prepare the local environment:
+
+```bash
+cd "$HOME/WebstormProjects/paperless-ai"
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[vision]"
+cp .env.example .env.lmstudio
+chmod 600 .env.lmstudio
+```
+
+Edit `.env.lmstudio` with your Paperless token and LM Studio settings. Then
+install the LaunchAgent:
+
+```bash
+scripts/install-launchd.sh
+```
+
+The default job runs:
+
+```bash
+paperless_lmstudio_classifier.py \
+  --provider lmstudio \
+  --limit 0 \
+  --threshold 0.86 \
+  --rules-first \
+  --drop-bulk-unclassified \
+  --timeout 300 \
+  --resume \
+  --workers 1 \
+  --output-dir paperless_lmstudio_runs/launchd-local
+```
+
+The classifier still uses its normal battery behavior: it pauses on battery and
+continues on AC power. The launchd wrapper prevents overlapping scheduled runs
+while one run is active or paused.
+
+Customize install-time settings with environment variables:
+
+```bash
+PAPERLESS_AI_START_INTERVAL=300 \
+PAPERLESS_AI_WORKERS=1 \
+PAPERLESS_AI_PROVIDER=lmstudio \
+PAPERLESS_AI_ENV_FILE="$PWD/.env.lmstudio" \
+PAPERLESS_AI_RUN_DIR="$PWD/paperless_lmstudio_runs/launchd-local" \
+scripts/install-launchd.sh
+```
+
+For OpenRouter:
+
+```bash
+PAPERLESS_AI_PROVIDER=openrouter \
+PAPERLESS_AI_ENV_FILE="$PWD/.env.openrouter" \
+PAPERLESS_AI_RUN_DIR="$PWD/paperless_lmstudio_runs/launchd-openrouter" \
+PAPERLESS_AI_WORKERS=4 \
+scripts/install-launchd.sh
+```
+
+Useful knobs:
+
+- `PAPERLESS_AI_START_INTERVAL`: polling interval in seconds, default `300`.
+- `PAPERLESS_AI_ENV_FILE`: private env file to source.
+- `PAPERLESS_AI_RUN_DIR`: output directory for `audit.jsonl`, `summary.md`, and logs.
+- `PAPERLESS_AI_WORKERS`: concurrent documents.
+- `PAPERLESS_AI_EXTRA_ARGS`: additional CLI flags, for example `--no-vision`.
+- `PAPERLESS_AI_NOTIFY`: set to `0` to disable macOS failure notifications.
+- `PAPERLESS_AI_LAUNCHD_LABEL`: launchd label, default `me.constantinschreiber.paperless-ai`.
+
+Check status:
+
+```bash
+launchctl print "gui/$(id -u)/me.constantinschreiber.paperless-ai"
+```
+
+Watch logs:
+
+```bash
+tail -f paperless_lmstudio_runs/launchd-local/run.log
+tail -f paperless_lmstudio_runs/launchd-local/launchd.stderr.log
+```
+
+Uninstall:
+
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/me.constantinschreiber.paperless-ai.plist"
+rm "$HOME/Library/LaunchAgents/me.constantinschreiber.paperless-ai.plist"
+```
+
 ## Audit Files
 
 `audit.jsonl` is the machine-readable record of every decision. `summary.md` is
