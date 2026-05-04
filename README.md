@@ -215,6 +215,7 @@ need new metadata, use `--apply-audit` instead of reclassifying:
 ```bash
 python3 paperless_lmstudio_classifier.py \
   --apply-audit paperless_lmstudio_runs/openrouter-bulk-vision-001/audit.jsonl \
+  --limit 0 \
   --threshold 0.86 \
   --workers 4
 ```
@@ -273,6 +274,7 @@ The same flag works with `--apply-audit` when the dry-run audit contains
 python3 paperless_lmstudio_classifier.py \
   --apply-audit paperless_lmstudio_runs/full-dryrun/audit.jsonl \
   --apply-review-metadata \
+  --limit 0 \
   --threshold 0.86
 ```
 
@@ -283,9 +285,16 @@ same stable run directory used by launchd:
 python3 paperless_lmstudio_classifier.py \
   --apply-audit paperless_lmstudio_runs/full-dryrun/audit.jsonl \
   --apply-review-metadata \
+  --limit 0 \
+  --resume \
   --threshold 0.86 \
   --output-dir paperless_lmstudio_runs/launchd-local
 ```
+
+With `--resume`, `--apply-audit` also seeds terminal source-audit records that
+are still in Inbox into the chosen output directory. That keeps known
+review-only, delete-candidate, and unreadable documents from being sent back to
+the model by the next launchd poll.
 
 ## Useful Modes
 
@@ -393,7 +402,7 @@ Document selection:
 - `--query`: Paperless full-text search filter.
 - `--page-size`: Paperless API page size.
 - `--ordering`: Paperless document ordering, for example `-created`.
-- `--resume`: Skip documents that already have terminal records in the chosen `audit.jsonl`, including `updated_kept_inbox`.
+- `--resume`: Skip documents that already have terminal records in the chosen `audit.jsonl`, including `updated_kept_inbox`. This also works with `--apply-audit` when you reuse a stable `--output-dir`.
 
 Apply behavior:
 

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
@@ -50,9 +50,14 @@ RESUME_SKIP_STATUSES = {
     "dry_run_ready",
     "updated",
     "updated_kept_inbox",
+    "skipped_already_not_in_inbox",
     "skipped_delete_candidate",
     "skipped_needs_review",
+    "skipped_unreadable",
 }
+TERMINAL_ERROR_MARKERS = (
+    "document closed or encrypted",
+)
 
 
 class ClassifierError(RuntimeError):
@@ -1335,6 +1340,38 @@ def should_apply(normalized: dict[str, Any], args: argparse.Namespace) -> tuple[
     return has_patchable_metadata(normalized)
 
 
+def status_for_error_message(message: str) -> tuple[str, str]:
+    if any(marker in message.casefold() for marker in TERMINAL_ERROR_MARKERS):
+        return "skipped_unreadable", message
+    return "failed", message
+
+
+def record_exception(record: dict[str, Any], exc: Exception) -> None:
+    status, message = status_for_error_message(str(exc))
+    record["status"] = status
+    if status.startswith("skipped"):
+        record["skip_reason"] = message
+    else:
+        record["error"] = message
+
+
+def resume_seed_record(source_record: dict[str, Any], source: Path) -> dict[str, Any] | None:
+    status = source_record.get("status")
+    if status in RESUME_SKIP_STATUSES:
+        seed = dict(source_record)
+    elif status == "failed":
+        error_status, message = status_for_error_message(str(source_record.get("error") or ""))
+        if error_status not in RESUME_SKIP_STATUSES:
+            return None
+        seed = dict(source_record)
+        seed["status"] = error_status
+        seed["skip_reason"] = message
+    else:
+        return None
+    seed["seeded_from_audit"] = str(source)
+    return seed
+
+
 def write_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
@@ -1669,8 +1706,7 @@ def run(args: argparse.Namespace) -> int:
                     record["status"] = "dry_run_ready"
                     record["skip_reason"] = "dry-run"
         except Exception as exc:  # noqa: BLE001 - audit should capture any per-document failure.
-            record["status"] = "failed"
-            record["error"] = str(exc)
+            record_exception(record, exc)
 
         if args.sleep:
             time.sleep(args.sleep)
@@ -1696,9 +1732,8 @@ def run(args: argparse.Namespace) -> int:
                     record = {
                         "document_id": doc_id,
                         "index": index,
-                        "status": "failed",
-                        "error": str(exc),
                     }
+                    record_exception(record, exc)
                 append_record_and_print(records, audit_jsonl, record, completed, total)
 
     markdown_summary(audit_md, records, args)
@@ -1747,11 +1782,45 @@ def apply_from_audit(args: argparse.Namespace) -> int:
                 )
                 candidates.append(record)
     candidates.sort(key=lambda record: int(record["document_id"]))
+
+    existing_records: list[dict[str, Any]] = []
+    resume_skipped = 0
+    resume_seeded = 0
+    if args.resume:
+        existing_records = read_jsonl(audit_jsonl)
+        latest = latest_by_document(existing_records)
+        candidate_ids = {int(record["document_id"]) for record in candidates}
+        current_inbox_ids = set(
+            paperless.inbox_ids(inbox.id, args.page_size, args.ordering, args.query, None)
+        )
+        for doc_id, source_record in sorted(source_records.items()):
+            if doc_id in candidate_ids or doc_id in latest or doc_id not in current_inbox_ids:
+                continue
+            seed = resume_seed_record(source_record, source)
+            if not seed:
+                continue
+            write_jsonl(audit_jsonl, seed)
+            existing_records.append(seed)
+            latest[doc_id] = seed
+            resume_seeded += 1
+        skip_ids = {
+            doc_id
+            for doc_id, record in latest.items()
+            if record.get("status") in RESUME_SKIP_STATUSES
+        }
+        resume_skipped = sum(1 for record in candidates if int(record["document_id"]) in skip_ids)
+        candidates = [
+            record for record in candidates if int(record["document_id"]) not in skip_ids
+        ]
     if args.limit:
         candidates = candidates[: args.limit]
 
     print(f"Applying audited patches from: {source}", flush=True)
     print(f"Run directory: {output_dir}", flush=True)
+    if args.resume:
+        print(f"Resume: {len(existing_records)} existing audit records", flush=True)
+        print(f"Resume seeded: {resume_seeded} terminal source records", flush=True)
+        print(f"Resume skipped: {resume_skipped} terminal documents", flush=True)
     print(f"Audited patches queued: {len(candidates)}", flush=True)
     print(f"Workers: {args.workers}", flush=True)
 
@@ -1816,14 +1885,13 @@ def apply_from_audit(args: argparse.Namespace) -> int:
                     record["status"] = "updated"
                     record["updated_title"] = result.get("title")
         except Exception as exc:  # noqa: BLE001 - audit should capture any per-document failure.
-            record["status"] = "failed"
-            record["error"] = str(exc)
+            record_exception(record, exc)
 
         if args.sleep:
             time.sleep(args.sleep)
         return record
 
-    records: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = list(existing_records)
     total = len(candidates)
     if args.workers == 1:
         for index, source_record in enumerate(candidates, 1):
@@ -1846,9 +1914,8 @@ def apply_from_audit(args: argparse.Namespace) -> int:
                     record = {
                         "document_id": doc_id,
                         "index": index,
-                        "status": "failed",
-                        "error": str(exc),
                     }
+                    record_exception(record, exc)
                 append_record_and_print(records, audit_jsonl, record, completed, total)
 
     markdown_summary(audit_md, records, args)
@@ -1883,6 +1950,14 @@ def self_test() -> int:
         False,
         "invalid tags",
     )
+    assert status_for_error_message("document closed or encrypted") == (
+        "skipped_unreadable",
+        "document closed or encrypted",
+    )
+    assert resume_seed_record(
+        {"document_id": 1, "status": "failed", "error": "document closed or encrypted"},
+        Path("audit.jsonl"),
+    )["status"] == "skipped_unreadable"
     assert build_patch(sample_normalized)["remove_inbox_tags"] is True
     review_patch = build_patch(sample_normalized, remove_inbox_tags=False, inbox_tag_id=9)
     assert "remove_inbox_tags" not in review_patch
