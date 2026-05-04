@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 DEFAULT_LMSTUDIO_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "gemma-4-31b-it"
@@ -1310,8 +1310,7 @@ def build_patch(
         "title": normalized["title"],
         "tags": tag_ids,
     }
-    if remove_inbox_tags:
-        patch["remove_inbox_tags"] = True
+    patch["remove_inbox_tags"] = remove_inbox_tags
     return patch
 
 
@@ -1960,7 +1959,7 @@ def self_test() -> int:
     )["status"] == "skipped_unreadable"
     assert build_patch(sample_normalized)["remove_inbox_tags"] is True
     review_patch = build_patch(sample_normalized, remove_inbox_tags=False, inbox_tag_id=9)
-    assert "remove_inbox_tags" not in review_patch
+    assert review_patch["remove_inbox_tags"] is False
     assert review_patch["tags"] == [3, 9]
     print("Self-test passed", flush=True)
     return 0
